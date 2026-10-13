@@ -2,7 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
-const { MongoClient } = require("mongodb");
+const { MongoClient, ObjectId } = require("mongodb");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
@@ -44,12 +44,51 @@ function isAdmin(ctx) {
     ctx.from?.id === ADMIN_ID;
 }
 
+
 bot.start(async (ctx) => {
+  const payload = ctx.startPayload;
+
+  if (payload && payload.startsWith("file_")) {
+    if (!ctx.chat || ctx.chat.type !== "private") {
+      return ctx.reply("ফাইল পেতে Bot-কে Private Chat-এ খুলুন।");
+    }
+
+    const fileId = payload.slice(5);
+
+    if (!ObjectId.isValid(fileId)) {
+      return ctx.reply("❌ Share Link সঠিক নয়।");
+    }
+
+    try {
+      const file = await db.collection("files").findOne({
+        _id: new ObjectId(fileId)
+      });
+
+      if (!file) {
+        return ctx.reply("❌ ফাইলটি পাওয়া যায়নি।");
+      }
+
+      await ctx.telegram.copyMessage(
+        ctx.chat.id,
+        file.storageChannelId,
+        file.storageMessageId
+      );
+    } catch (error) {
+      console.error("File delivery error:", error.message);
+      await ctx.reply(
+        "❌ ফাইল পাঠানো যায়নি। পরে আবার চেষ্টা করুন।"
+      );
+    }
+
+    return;
+  }
+
   await ctx.reply(
     "👋 Welcome to Telegram File Store Bot!\n\n" +
-    "File sharing features are being set up."
+    "ফাইল পেতে একটি বৈধ Share Link খুলুন।"
   );
 });
+
 
 bot.command("help", async (ctx) => {
   await ctx.reply(
@@ -160,6 +199,45 @@ bot.on(
     }
   }
 );
+
+
+bot.command("genlink", async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.reply("⛔ You are not authorized.");
+  }
+
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const fileId = parts[1];
+
+  if (!fileId || !ObjectId.isValid(fileId)) {
+    return ctx.reply(
+      "ব্যবহার:\n/genlink FILE_ID\n\n" +
+      "File ID পেতে File stored successfully মেসেজ দেখো।"
+    );
+  }
+
+  try {
+    const file = await db.collection("files").findOne({
+      _id: new ObjectId(fileId)
+    });
+
+    if (!file) {
+      return ctx.reply("❌ এই File ID-তে কোনো ফাইল পাওয়া যায়নি।");
+    }
+
+    const me = await ctx.telegram.getMe();
+    const link =
+      `https://t.me/${me.username}?start=file_${file._id}`;
+
+    await ctx.reply(
+      "🔗 Share Link তৈরি হয়েছে!\n\n" +
+      link
+    );
+  } catch (error) {
+    console.error("Generate link error:", error.message);
+    await ctx.reply("❌ Link তৈরি করা যায়নি। Logs পরীক্ষা করো।");
+  }
+});
 
 bot.catch((err) => {
   console.error("Telegram bot error:", err.message);
