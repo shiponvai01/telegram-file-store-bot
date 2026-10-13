@@ -22,6 +22,8 @@ const bot = new Telegraf(BOT_TOKEN);
 const mongoClient = new MongoClient(MONGODB_URI);
 
 let db;
+// Temporary pending files (memory only)
+const pendingFiles = new Map();
 
 app.get("/", (req, res) => {
   res.status(200).send("Telegram File Store Bot is running.");
@@ -130,75 +132,60 @@ bot.command("admin", async (ctx) => {
 
 const STORAGE_CHANNEL_ID = process.env.STORAGE_CHANNEL_ID;
 
+
 bot.on(
   ["document", "video", "audio", "photo", "animation", "voice", "video_note"],
   async (ctx) => {
-    if (!isAdmin(ctx)) {
-      return;
-    }
+    if (!isAdmin(ctx)) return;
 
-    if (!STORAGE_CHANNEL_ID) {
-      return ctx.reply("❌ Storage channel is not configured.");
-    }
+    const pending = pendingFiles.get(ctx.from.id);
 
-    try {
-      const message = ctx.message;
-      let fileId;
-      let fileType;
-
-      if (message.document) {
-        fileId = message.document.file_id;
-        fileType = "document";
-      } else if (message.video) {
-        fileId = message.video.file_id;
-        fileType = "video";
-      } else if (message.audio) {
-        fileId = message.audio.file_id;
-        fileType = "audio";
-      } else if (message.photo) {
-        const photo = message.photo;
-        fileId = photo[photo.length - 1].file_id;
-        fileType = "photo";
-      } else if (message.animation) {
-        fileId = message.animation.file_id;
-        fileType = "animation";
-      } else if (message.voice) {
-        fileId = message.voice.file_id;
-        fileType = "voice";
-      } else if (message.video_note) {
-        fileId = message.video_note.file_id;
-        fileType = "video_note";
-      }
-
-      const copied = await ctx.telegram.copyMessage(
-        STORAGE_CHANNEL_ID,
-        ctx.chat.id,
-        message.message_id
-      );
-
-      const result = await db.collection("files").insertOne({
-        fileId,
-        fileType,
-        storageChannelId: String(STORAGE_CHANNEL_ID),
-        storageMessageId: copied.message_id,
-        uploadedBy: ctx.from.id,
-        caption: message.caption || "",
-        createdAt: new Date()
-      });
-
-      await ctx.reply(
-        "✅ File stored successfully!\n\n" +
-        "File ID: " + result.insertedId.toString() + "\n" +
-        "Type: " + fileType
-      );
-    } catch (error) {
-      console.error("File storage error:", error.message);
-      await ctx.reply(
-        "❌ File storage failed. Please check the bot logs."
+    if (!pending || !pending.waitingForFile) {
+      return ctx.reply(
+        "ℹ️ প্রথমে /genlink পাঠাও, তারপর ফাইল পাঠাও।"
       );
     }
+
+    let fileType;
+
+    if (ctx.message.document) fileType = "document";
+    else if (ctx.message.video) fileType = "video";
+    else if (ctx.message.audio) fileType = "audio";
+    else if (ctx.message.photo) fileType = "photo";
+    else if (ctx.message.animation) fileType = "animation";
+    else if (ctx.message.voice) fileType = "voice";
+    else if (ctx.message.video_note) fileType = "video_note";
+
+    pendingFiles.set(ctx.from.id, {
+      waitingForFile: false,
+      chatId: ctx.chat.id,
+      messageId: ctx.message.message_id,
+      fileType,
+      caption: ctx.message.caption || "",
+      createdAt: Date.now()
+    });
+
+    return ctx.reply(
+      `📦 Are you sure you want to store this ${fileType}?\n\n` +
+      "Generate Link চাপলে ফাইলটি Store হবে।",
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "🔗 Generate Link",
+            "genlink_confirm"
+          ),
+          Markup.button.callback(
+            "❌ Cancel",
+            "genlink_cancel"
+          )
+        ]
+      ])
+    );
   }
 );
+
+
+
 
 
 bot.command("genlink", async (ctx) => {
@@ -206,37 +193,119 @@ bot.command("genlink", async (ctx) => {
     return ctx.reply("⛔ You are not authorized.");
   }
 
-  const parts = ctx.message.text.trim().split(/\s+/);
-  const fileId = parts[1];
+  pendingFiles.set(ctx.from.id, {
+    waitingForFile: true,
+    createdAt: Date.now()
+  });
 
-  if (!fileId || !ObjectId.isValid(fileId)) {
-    return ctx.reply(
-      "ব্যবহার:\n/genlink FILE_ID\n\n" +
-      "File ID পেতে File stored successfully মেসেজ দেখো।"
+  return ctx.reply(
+    "📤 Send me the file, video, document, photo, APK, or other item you want to store.\n\n" +
+    "❌ Cancel করতে /cancel পাঠাও।"
+  );
+});
+
+
+
+bot.action("genlink_cancel", async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery("⛔ Not authorized.");
+  }
+
+  pendingFiles.delete(ctx.from.id);
+
+  await ctx.answerCbQuery("Cancelled.");
+  return ctx.editMessageText(
+    "❌ Cancelled. ফাইলটি Store করা হয়নি।\n\n" +
+    "আবার শুরু করতে /genlink পাঠাও।"
+  );
+});
+
+bot.action("genlink_confirm", async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery("⛔ Not authorized.");
+  }
+
+  const pending = pendingFiles.get(ctx.from.id);
+
+  if (!pending || pending.waitingForFile) {
+    await ctx.answerCbQuery("কোনো অপেক্ষমাণ ফাইল পাওয়া যায়নি।");
+    return ctx.editMessageText(
+      "❌ ফাইলের তথ্য পাওয়া যায়নি। আবার /genlink পাঠাও।"
     );
   }
 
-  try {
-    const file = await db.collection("files").findOne({
-      _id: new ObjectId(fileId)
-    });
+  if (Date.now() - pending.createdAt > 30 * 60 * 1000) {
+    pendingFiles.delete(ctx.from.id);
+    await ctx.answerCbQuery("Confirmation expired.");
+    return ctx.editMessageText(
+      "⌛ সময় শেষ হয়েছে। আবার /genlink পাঠাও।"
+    );
+  }
 
-    if (!file) {
-      return ctx.reply("❌ এই File ID-তে কোনো ফাইল পাওয়া যায়নি।");
-    }
+  if (!STORAGE_CHANNEL_ID) {
+    return ctx.answerCbQuery(
+      "Storage channel configure করা নেই।",
+      { show_alert: true }
+    );
+  }
+
+  await ctx.answerCbQuery("ফাইল Store করা হচ্ছে...");
+
+  try {
+    const copied = await ctx.telegram.copyMessage(
+      STORAGE_CHANNEL_ID,
+      pending.chatId,
+      pending.messageId
+    );
+
+    const result = await db.collection("files").insertOne({
+      fileType: pending.fileType,
+      storageChannelId: String(STORAGE_CHANNEL_ID),
+      storageMessageId: copied.message_id,
+      uploadedBy: ctx.from.id,
+      caption: pending.caption,
+      createdAt: new Date()
+    });
 
     const me = await ctx.telegram.getMe();
     const link =
-      `https://t.me/${me.username}?start=file_${file._id}`;
+      `https://t.me/${me.username}?start=file_${result.insertedId}`;
 
-    await ctx.reply(
+    pendingFiles.delete(ctx.from.id);
+
+    return ctx.editMessageText(
+      "✅ File stored successfully!\n\n" +
       "🔗 Share Link তৈরি হয়েছে!\n\n" +
       link
     );
   } catch (error) {
-    console.error("Generate link error:", error.message);
-    await ctx.reply("❌ Link তৈরি করা যায়নি। Logs পরীক্ষা করো।");
+    console.error("File storage error:", error.message);
+
+    return ctx.reply(
+      "❌ ফাইল Store করা যায়নি।\n" +
+      "সমস্যা ঠিক করে আবার Generate Link চাপো।"
+    );
   }
+});
+
+
+bot.command("cancel", async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.reply("⛔ You are not authorized.");
+  }
+
+  const pending = pendingFiles.get(ctx.from.id);
+
+  if (!pending) {
+    return ctx.reply("ℹ️ বাতিল করার মতো কোনো কাজ নেই।");
+  }
+
+  pendingFiles.delete(ctx.from.id);
+
+  return ctx.reply(
+    "❌ Cancelled. ফাইলটি Store করা হয়নি।\n\n" +
+    "আবার শুরু করতে /genlink পাঠাও।"
+  );
 });
 
 bot.catch((err) => {
