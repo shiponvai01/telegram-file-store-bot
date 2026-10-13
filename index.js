@@ -1,7 +1,7 @@
 require("dotenv").config();
 
 const express = require("express");
-const { Telegraf } = require("telegraf");
+const { Telegraf, Markup } = require("telegraf");
 const { MongoClient } = require("mongodb");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -66,7 +66,25 @@ bot.command("admin", async (ctx) => {
 
   await ctx.reply(
     "👑 Admin Panel\n\n" +
-    "Admin controls will be added next."
+    "নিচের একটি অপশন নির্বাচন করুন:",
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("📁 File Management", "admin_files"),
+        Markup.button.callback("👥 Users", "admin_users")
+      ],
+      [
+        Markup.button.callback("🔗 Generate Link", "admin_genlink"),
+        Markup.button.callback("📦 Batch", "admin_batch")
+      ],
+      [
+        Markup.button.callback("📢 Broadcast", "admin_broadcast"),
+        Markup.button.callback("🚫 Ban / Unban", "admin_ban")
+      ],
+      [
+        Markup.button.callback("⚙️ Settings", "admin_settings"),
+        Markup.button.callback("📊 Statistics", "admin_stats")
+      ]
+    ])
   );
 });
 
