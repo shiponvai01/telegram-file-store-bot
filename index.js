@@ -58,6 +58,42 @@ function isAdmin(ctx) {
   return ctx.from?.id === ADMIN_ID;
 }
 
+
+bot.use(async (ctx, next) => {
+  try {
+    if (
+      db &&
+      ctx.from &&
+      ctx.chat?.type === "private"
+    ) {
+      const now = new Date();
+
+      await db.collection("users").updateOne(
+        { telegramId: ctx.from.id },
+        {
+          $set: {
+            firstName: ctx.from.first_name || "",
+            lastName: ctx.from.last_name || "",
+            username: ctx.from.username || "",
+            languageCode: ctx.from.language_code || "",
+            lastSeenAt: now
+          },
+          $setOnInsert: {
+            telegramId: ctx.from.id,
+            firstSeenAt: now
+          }
+        },
+        { upsert: true }
+      );
+    }
+  } catch (error) {
+    console.error("User tracking error:", error.message);
+  }
+
+  return next();
+});
+
+
 // Telegram /start and share-link delivery
 bot.start(async (ctx) => {
   const payload = ctx.startPayload;
@@ -184,6 +220,107 @@ bot.command("admin", async (ctx) => {
   return ctx.reply(
     "👑 Admin Panel\n\n" +
     "নিচের একটি অপশন নির্বাচন করুন:",
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("📁 File Management", "admin_files"),
+        Markup.button.callback("👥 Users", "admin_users")
+      ],
+      [
+        Markup.button.callback("🔗 Generate Link", "admin_genlink"),
+        Markup.button.callback("📦 Batch", "admin_batch")
+      ],
+      [
+        Markup.button.callback("📢 Broadcast", "admin_broadcast"),
+        Markup.button.callback("🚫 Ban / Unban", "admin_ban")
+      ],
+      [
+        Markup.button.callback("⚙️ Settings", "admin_settings"),
+        Markup.button.callback("📊 Statistics", "admin_stats")
+      ]
+    ])
+  );
+});
+
+
+bot.action("admin_users", async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery("Not authorized.");
+  }
+
+  try {
+    await ctx.answerCbQuery();
+
+    const users = db.collection("users");
+    const total = await users.countDocuments();
+
+    const list = await users
+      .find({})
+      .sort({ lastSeenAt: -1 })
+      .limit(10)
+      .toArray();
+
+    let message =
+      "👥 USER MANAGEMENT\n\n" +
+      `মোট ব্যবহারকারী: ${total}\n\n`;
+
+    if (list.length === 0) {
+      message +=
+        "এখনো কোনো ব্যবহারকারীর রেকর্ড নেই।\n\n" +
+        "ব্যবহারকারীরা বটের সঙ্গে যোগাযোগ করলে এখানে দেখা যাবে।";
+    } else {
+      list.forEach((user, index) => {
+        const name = [
+          user.firstName,
+          user.lastName
+        ].filter(Boolean).join(" ") || "নাম নেই";
+
+        message +=
+          `${index + 1}. ${name}\n` +
+          `🆔 ID: ${user.telegramId}\n` +
+          `👤 Username: ${
+            user.username ? "@" + user.username : "নেই"
+          }\n\n`;
+      });
+
+      if (total > 10) {
+        message += "ℹ️ এখানে সর্বশেষ ১০ জন দেখানো হচ্ছে।\n\n";
+      }
+    }
+
+    return await ctx.editMessageText(
+      message,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("🔄 Refresh", "admin_users")
+        ],
+        [
+          Markup.button.callback("⬅️ Admin Panel", "admin_back")
+        ]
+      ])
+    );
+  } catch (error) {
+    if (error.description?.includes("message is not modified")) {
+      return;
+    }
+
+    console.error("Admin users error:", error.message);
+
+    return ctx.reply(
+      "❌ ব্যবহারকারীদের তালিকা লোড করা যায়নি।"
+    );
+  }
+});
+
+// Return to Admin Panel
+bot.action("admin_back", async (ctx) => {
+  if (!isAdmin(ctx)) {
+    return ctx.answerCbQuery("Not authorized.");
+  }
+
+  await ctx.answerCbQuery();
+
+  return ctx.editMessageText(
+    "👑 Admin Panel\n\nনিচের একটি অপশন নির্বাচন করুন:",
     Markup.inlineKeyboard([
       [
         Markup.button.callback("📁 File Management", "admin_files"),
