@@ -88,6 +88,79 @@ bot.command("admin", async (ctx) => {
   );
 });
 
+
+const STORAGE_CHANNEL_ID = process.env.STORAGE_CHANNEL_ID;
+
+bot.on(
+  ["document", "video", "audio", "photo", "animation", "voice", "video_note"],
+  async (ctx) => {
+    if (!isAdmin(ctx)) {
+      return;
+    }
+
+    if (!STORAGE_CHANNEL_ID) {
+      return ctx.reply("❌ Storage channel is not configured.");
+    }
+
+    try {
+      const message = ctx.message;
+      let fileId;
+      let fileType;
+
+      if (message.document) {
+        fileId = message.document.file_id;
+        fileType = "document";
+      } else if (message.video) {
+        fileId = message.video.file_id;
+        fileType = "video";
+      } else if (message.audio) {
+        fileId = message.audio.file_id;
+        fileType = "audio";
+      } else if (message.photo) {
+        const photo = message.photo;
+        fileId = photo[photo.length - 1].file_id;
+        fileType = "photo";
+      } else if (message.animation) {
+        fileId = message.animation.file_id;
+        fileType = "animation";
+      } else if (message.voice) {
+        fileId = message.voice.file_id;
+        fileType = "voice";
+      } else if (message.video_note) {
+        fileId = message.video_note.file_id;
+        fileType = "video_note";
+      }
+
+      const copied = await ctx.telegram.copyMessage(
+        STORAGE_CHANNEL_ID,
+        ctx.chat.id,
+        message.message_id
+      );
+
+      const result = await db.collection("files").insertOne({
+        fileId,
+        fileType,
+        storageChannelId: String(STORAGE_CHANNEL_ID),
+        storageMessageId: copied.message_id,
+        uploadedBy: ctx.from.id,
+        caption: message.caption || "",
+        createdAt: new Date()
+      });
+
+      await ctx.reply(
+        "✅ File stored successfully!\n\n" +
+        "File ID: " + result.insertedId.toString() + "\n" +
+        "Type: " + fileType
+      );
+    } catch (error) {
+      console.error("File storage error:", error.message);
+      await ctx.reply(
+        "❌ File storage failed. Please check the bot logs."
+      );
+    }
+  }
+);
+
 bot.catch((err) => {
   console.error("Telegram bot error:", err.message);
 });
