@@ -8,8 +8,8 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 const MONGODB_URI = process.env.MONGODB_URI;
 const STORAGE_CHANNEL_ID = process.env.STORAGE_CHANNEL_ID;
-const PORT = process.env.PORT;
-const DB_NAME = process.env.DB_NAME;
+const PORT = process.env.PORT || "telegram_file_store";
+const DB_NAME = process.env.DB_NAME || 3000;
 
 if (!BOT_TOKEN) {
   throw new Error("BOT_TOKEN is missing.");
