@@ -36,6 +36,7 @@ const pendingBatches = new Map();
 
 // Admin setup input states are temporary; saved settings are stored in MongoDB.
 const adminInputStates = new Map();
+const broadcastStates = new Map();
 
 const DEFAULT_START_TEXT =
   "👋 Welcome to Telegram File Store Bot!\n\n" +
@@ -339,6 +340,212 @@ async function sendDeliveredCopy(ctx, file) {
   return sent;
 }
 
+
+function getTodayStart() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
+
+async function recordLinkOpen(userId, linkType, linkId) {
+  if (!db) return;
+  try {
+    await db.collection("linkEvents").insertOne({
+      userId,
+      type: linkType,
+      linkId: String(linkId),
+      createdAt: new Date()
+    });
+  } catch (error) {
+    console.error("Link event error:", error.message);
+  }
+}
+
+async function startSingleLinkFlow(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply("⛔ You are not authorized.");
+
+  const userId = ctx.from.id;
+  if (pendingBatches.has(userId)) {
+    return ctx.reply("⚠️ আগে চলমান Batch সম্পন্ন করো অথবা /cancelbatch পাঠাও।");
+  }
+  if (pendingFiles.has(userId)) {
+    return ctx.reply("⚠️ একটি Single File Upload অপেক্ষায় আছে।\nআগে সেটি সম্পন্ন করো অথবা /cancel পাঠাও।");
+  }
+
+  pendingFiles.set(userId, { waitingForFile: true, createdAt: Date.now() });
+  return ctx.reply(
+    "📤 Send me the file, video, document, photo, APK, or other item you want to store.\n\n" +
+    "❌ Cancel করতে /cancel পাঠাও।"
+  );
+}
+
+async function startBatchFlow(ctx) {
+  if (!isAdmin(ctx)) return ctx.reply("⛔ You are not authorized.");
+
+  const userId = ctx.from.id;
+  if (pendingFiles.has(userId)) {
+    return ctx.reply("⚠️ আগে Single Upload সম্পন্ন করো অথবা /cancel পাঠাও।");
+  }
+  if (pendingBatches.has(userId)) {
+    return ctx.reply("⚠️ একটি Batch-এর কাজ ইতিমধ্যে চলছে।\nআগে সেটি সম্পন্ন করো অথবা বাতিল করো।");
+  }
+
+  pendingBatches.set(userId, {
+    files: [],
+    status: "collecting",
+    createdAt: Date.now(),
+    inProgress: false
+  });
+
+  return ctx.reply(
+    "📦 Batch Upload শুরু হয়েছে!\n\n" +
+    "এখন একে একে তোমার ফাইলগুলো পাঠাও।\n" +
+    "সব ফাইল পাঠানো হলে /finishbatch পাঠাও।\n\n" +
+    "❌ বাতিল করতে /cancelbatch পাঠাও।"
+  );
+}
+
+function broadcastChoiceKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("➕ ADD More", "broadcast_add_more"),
+      Markup.button.callback("No", "broadcast_done")
+    ]
+  ]);
+}
+
+function broadcastConfirmKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Start Broadcast", "broadcast_start")],
+    [Markup.button.callback("❌ Cancel", "broadcast_cancel")]
+  ]);
+}
+
+async function promptBroadcast(ctx) {
+  broadcastStates.set(ctx.from.id, {
+    status: "collecting",
+    messages: [],
+    createdAt: Date.now()
+  });
+  return ctx.reply(
+    "দয়া করে আপনি যে মেসেজটি ব্রডকাস্ট করতে চান (লেখা, ফটো, ভিডিও বা অডিও), সেটি এখানে ফরোয়ার্ড করুন বা টাইপ করে পাঠান। বাতিল করতে /cancel লিখুন।"
+  );
+}
+
+async function addBroadcastMessage(ctx) {
+  const state = broadcastStates.get(ctx.from.id);
+  if (!state || state.status !== "collecting") return false;
+  if (state.messages.length >= 20) {
+    await ctx.reply("⚠️ সর্বোচ্চ ২০টি message একসাথে broadcast করা যাবে।");
+    return true;
+  }
+
+  state.messages.push({
+    chatId: ctx.chat.id,
+    messageId: ctx.message.message_id,
+    type: ctx.message.text ? "text" : "media"
+  });
+
+  await ctx.reply(
+    `✅ Broadcast message ${state.messages.length} যোগ হয়েছে।\n\nআরও কিছু পাঠাতে চাইলে ➕ ADD More চাপো। সব শেষ হলে No চাপো।`,
+    broadcastChoiceKeyboard()
+  );
+  return true;
+}
+
+async function showBroadcastConfirmation(ctx) {
+  const state = broadcastStates.get(ctx.from.id);
+  if (!state || state.status !== "collecting" || state.messages.length === 0) {
+    return ctx.reply("⚠️ Broadcast করার মতো কোনো message নেই।");
+  }
+  state.status = "review";
+  return ctx.reply(
+    `📢 Broadcast Confirmation\n\nমোট message: ${state.messages.length}\n\n` +
+    "সব ঠিক থাকলে নিচের Start Broadcast button চাপো।",
+    broadcastConfirmKeyboard()
+  );
+}
+
+async function executeBroadcast(ctx) {
+  const userId = ctx.from.id;
+  const state = broadcastStates.get(userId);
+  if (!state || state.status !== "review" || !state.messages.length) {
+    return ctx.answerCbQuery("কোনো Broadcast প্রস্তুত নেই।", { show_alert: true });
+  }
+  if (state.inProgress) {
+    return ctx.answerCbQuery("Broadcast ইতিমধ্যে চলছে।", { show_alert: true });
+  }
+
+  state.inProgress = true;
+  state.status = "sending";
+
+  try {
+    const users = await db.collection("users")
+      .find({ telegramId: { $ne: ADMIN_ID }, banned: { $ne: true } }, { projection: { telegramId: 1 } })
+      .toArray();
+
+    const total = users.length;
+    let success = 0;
+    let failed = 0;
+
+    await ctx.answerCbQuery("Broadcast শুরু হয়েছে...");
+    const progressMessage = await ctx.reply(`Sending to 0/${total} users...`);
+
+    for (let i = 0; i < users.length; i++) {
+      const targetId = users[i].telegramId;
+      let userSuccess = true;
+
+      for (const item of state.messages) {
+        try {
+          await ctx.telegram.copyMessage(targetId, item.chatId, item.messageId);
+        } catch (error) {
+          userSuccess = false;
+          console.error(`Broadcast delivery error for ${targetId}:`, error.message);
+          break;
+        }
+      }
+
+      if (userSuccess) success++;
+      else failed++;
+
+      if ((i + 1) % 10 === 0 || i === users.length - 1) {
+        try {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            progressMessage.message_id,
+            undefined,
+            `Sending to ${i + 1}/${total} users...`
+          );
+        } catch (error) {
+          console.error("Broadcast progress update error:", error.message);
+        }
+      }
+
+      // Keep a small gap between users to reduce Telegram flood-limit risk.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+
+    try {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        progressMessage.message_id,
+        undefined,
+        `Broadcast completed successfully to ${success} users!` +
+        (failed ? `\nFailed: ${failed} users.` : "")
+      );
+    } catch (error) {
+      await ctx.reply(
+        `Broadcast completed successfully to ${success} users!` +
+        (failed ? `\nFailed: ${failed} users.` : "")
+      );
+    }
+  } catch (error) {
+    console.error("Broadcast error:", error.message);
+    await ctx.reply("❌ Broadcast সম্পন্ন করা যায়নি। Render Logs পরীক্ষা করো।");
+  } finally {
+    broadcastStates.delete(userId);
+  }
+}
+
 function forceSubKeyboard(channels) {
   const rows = channels.map((channel, index) => [Markup.button.url(`📢 Join Channel ${index + 1}`, channel.joinUrl)]);
   rows.push([Markup.button.callback("✅ আমি Join করেছি — Check", "force_sub_check")]);
@@ -399,7 +606,8 @@ bot.use(async (ctx, next) => {
           },
           $setOnInsert: {
             telegramId: ctx.from.id,
-            firstSeenAt: now
+            firstSeenAt: now,
+            banned: false
           }
         },
         { upsert: true }
@@ -409,6 +617,28 @@ bot.use(async (ctx, next) => {
     console.error("User tracking error:", error.message);
   }
 
+  return next();
+});
+
+
+bot.use(async (ctx, next) => {
+  if (!ctx.from || ctx.from.id === ADMIN_ID || ctx.chat?.type !== "private") return next();
+  try {
+    const user = await db.collection("users").findOne(
+      { telegramId: ctx.from.id },
+      { projection: { banned: 1 } }
+    );
+    if (user?.banned === true) {
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery("⛔ You are banned from using this bot.", { show_alert: true }).catch(() => {});
+      } else {
+        await ctx.reply("⛔ You are banned from using this bot.");
+      }
+      return;
+    }
+  } catch (error) {
+    console.error("Ban check error:", error.message);
+  }
   return next();
 });
 
@@ -444,6 +674,7 @@ bot.start(async (ctx) => {
         fileSize: file.fileSize || 0,
         caption: file.caption || ""
       });
+      await recordLinkOpen(ctx.from.id, "file", fileId);
     } catch (error) {
       console.error("File delivery error:", error.message);
       await ctx.reply("❌ ফাইল পাঠানো যায়নি। পরে আবার চেষ্টা করুন।");
@@ -495,6 +726,7 @@ bot.start(async (ctx) => {
           caption: file.caption || ""
         });
       }
+      await recordLinkOpen(ctx.from.id, "batch", batchId);
     } catch (error) {
       console.error("Batch delivery error:", error.message);
       await ctx.reply(
@@ -538,6 +770,114 @@ bot.command("admin", async (ctx) => {
     "👑 Admin Panel\n\nনিচের একটি অপশন নির্বাচন করুন:",
     adminPanelKeyboard()
   );
+});
+
+// Admin panel actions
+bot.action("admin_files", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  return ctx.reply("📁 File Management এখনো configure করা হয়নি। পরে এই section-এ feature যোগ করা হবে।");
+});
+
+bot.action("admin_genlink", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  return startSingleLinkFlow(ctx);
+});
+
+bot.action("admin_batch", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  return startBatchFlow(ctx);
+});
+
+bot.action("admin_broadcast", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  return promptBroadcast(ctx);
+});
+
+bot.action("admin_ban", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  return ctx.reply(
+    "🚫 Ban / Unban\n\nনিচের একটি অপশন নির্বাচন করুন:",
+    Markup.inlineKeyboard([
+      [Markup.button.callback("🚫 Ban User", "ban_user")],
+      [Markup.button.callback("✅ Unban User", "unban_user")],
+      [Markup.button.callback("⬅️ Admin Panel", "admin_back")]
+    ])
+  );
+});
+
+bot.action("ban_user", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  adminInputStates.set(ctx.from.id, { type: "ban_user" });
+  return ctx.reply("দয়া করে যে ইউজারকে ব্যান করতে চান, তার Telegram User ID-টি পাঠান।\n\nবাতিল করতে /cancel লিখুন।");
+});
+
+bot.action("unban_user", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  adminInputStates.set(ctx.from.id, { type: "unban_user" });
+  return ctx.reply("দয়া করে যে ইউজারকে UnBan করতে চান, তার Telegram User ID-টি পাঠান।\n\nবাতিল করতে /cancel লিখুন।");
+});
+
+bot.action("admin_stats", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+
+  try {
+    const today = getTodayStart();
+    const [totalUsers, activeUsers, bannedUsers, totalFiles, todayLinks] = await Promise.all([
+      db.collection("users").countDocuments(),
+      db.collection("users").countDocuments({ lastSeenAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } }),
+      db.collection("users").countDocuments({ banned: true }),
+      db.collection("files").countDocuments(),
+      db.collection("linkEvents").countDocuments({ createdAt: { $gte: today } })
+    ]);
+
+    return ctx.reply(
+      "📊 BOT STATISTICS REPORT 📊\n" +
+      "---------------------------------\n" +
+      `👥 Total Users: ${totalUsers}\n` +
+      `🟢 Active Users (24h): ${activeUsers}\n` +
+      `🚫 Banned Users: ${bannedUsers}\n\n` +
+      `📁 Total Files in DB: ${totalFiles}\n` +
+      `📥 Total Links Open /Downloads Today: ${todayLinks}\n` +
+      "---------------------------------"
+    );
+  } catch (error) {
+    console.error("Statistics error:", error.message);
+    return ctx.reply("❌ Statistics তৈরি করা যায়নি।");
+  }
+});
+
+bot.action("broadcast_add_more", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  const state = broadcastStates.get(ctx.from.id);
+  if (!state || state.status !== "collecting") return ctx.answerCbQuery("Broadcast session পাওয়া যায়নি।", { show_alert: true });
+  await ctx.answerCbQuery();
+  return ctx.reply("➕ আরও একটি message/file পাঠাও। সব শেষ হলে No চাপো।");
+});
+
+bot.action("broadcast_done", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  return showBroadcastConfirmation(ctx);
+});
+
+bot.action("broadcast_cancel", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  broadcastStates.delete(ctx.from.id);
+  await ctx.answerCbQuery("Broadcast cancelled.");
+  return ctx.editMessageText("❌ Broadcast Cancelled. কোনো user-কে message পাঠানো হয়নি।");
+});
+
+bot.action("broadcast_start", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  return executeBroadcast(ctx);
 });
 
 // Settings -> Start Message
@@ -778,6 +1118,16 @@ bot.on("text", async (ctx, next) => {
     return next();
   }
 
+
+  const broadcast = broadcastStates.get(ctx.from.id);
+  if (broadcast && broadcast.status === "collecting") {
+    if (ctx.message.text === "/cancel") {
+      broadcastStates.delete(ctx.from.id);
+      return ctx.reply("❌ Broadcast Cancelled. কোনো user-কে message পাঠানো হয়নি।");
+    }
+    return addBroadcastMessage(ctx);
+  }
+
   const state = adminInputStates.get(ctx.from.id);
   if (!state) {
     return next();
@@ -968,6 +1318,35 @@ bot.on("text", async (ctx, next) => {
     adminInputStates.set(ctx.from.id, { type: "shortener_api_key", name: state.name, apiUrl: value });
     return ctx.reply("Provider API key পাঠাও। API key না লাগলে NONE পাঠাও।");
   }
+
+  if (state.type === "ban_user" || state.type === "unban_user") {
+    if (!/^\d+$/.test(value)) {
+      return ctx.reply("⚠️ সঠিক Telegram User ID পাঠাও। উদাহরণ: 123456789");
+    }
+    const targetId = Number(value);
+    if (!Number.isSafeInteger(targetId) || targetId <= 0) {
+      return ctx.reply("⚠️ সঠিক Telegram User ID পাঠাও।");
+    }
+    if (targetId === ADMIN_ID) {
+      return ctx.reply("⛔ Admin-কে Ban/Unban করা যাবে না।");
+    }
+
+    const isBan = state.type === "ban_user";
+    await db.collection("users").updateOne(
+      { telegramId: targetId },
+      {
+        $set: { banned: isBan, updatedAt: new Date() },
+        $setOnInsert: { telegramId: targetId, firstSeenAt: new Date(), lastSeenAt: new Date() }
+      },
+      { upsert: true }
+    );
+    adminInputStates.delete(ctx.from.id);
+    return ctx.reply(isBan
+      ? `User ${targetId} has been banned successfully.`
+      : `User ${targetId} has been unbanned successfully.`
+    );
+  }
+
   if (state.type === "shortener_api_key") {
     const apiKey = value.toUpperCase() === "NONE" ? "" : value;
     await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { linkShortener: { name: state.name, apiUrl: state.apiUrl, apiKey, enabled: false }, updatedAt: new Date() } }, { upsert: true });
@@ -1057,6 +1436,12 @@ bot.on(
 
     const userId = ctx.from.id;
     const adminState = adminInputStates.get(userId);
+
+
+    const broadcast = broadcastStates.get(userId);
+    if (broadcast && broadcast.status === "collecting") {
+      return addBroadcastMessage(ctx);
+    }
 
     // Start Photo setup takes priority over normal file/batch upload collection.
     if (adminState?.type === "start_photo") {
@@ -1164,34 +1549,7 @@ bot.on(
 
 // Start single-file upload
 bot.command("genlink", async (ctx) => {
-  if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ You are not authorized.");
-  }
-
-  const userId = ctx.from.id;
-
-  if (pendingBatches.has(userId)) {
-    return ctx.reply(
-      "⚠️ আগে চলমান Batch সম্পন্ন করো অথবা /cancelbatch পাঠাও।"
-    );
-  }
-
-  if (pendingFiles.has(userId)) {
-    return ctx.reply(
-      "⚠️ একটি Single File Upload অপেক্ষায় আছে।\n" +
-      "আগে সেটি সম্পন্ন করো অথবা /cancel পাঠাও।"
-    );
-  }
-
-  pendingFiles.set(userId, {
-    waitingForFile: true,
-    createdAt: Date.now()
-  });
-
-  return ctx.reply(
-    "📤 Send me the file, video, document, photo, APK, or other item you want to store.\n\n" +
-    "❌ Cancel করতে /cancel পাঠাও।"
-  );
+  return startSingleLinkFlow(ctx);
 });
 
 // Cancel single-file confirmation
@@ -1326,6 +1684,11 @@ bot.command("cancel", async (ctx) => {
     return ctx.reply("⛔ You are not authorized.");
   }
 
+  if (broadcastStates.has(ctx.from.id)) {
+    broadcastStates.delete(ctx.from.id);
+    return ctx.reply("❌ Broadcast Cancelled. কোনো user-কে message পাঠানো হয়নি।");
+  }
+
   if (adminInputStates.has(ctx.from.id)) {
     adminInputStates.delete(ctx.from.id);
     return ctx.reply(
@@ -1354,36 +1717,7 @@ bot.command("cancel", async (ctx) => {
 
 // Start batch upload
 bot.command("batch", async (ctx) => {
-  if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ You are not authorized.");
-  }
-
-  const userId = ctx.from.id;
-
-  if (pendingFiles.has(userId)) {
-    return ctx.reply("⚠️ আগে Single Upload সম্পন্ন করো অথবা /cancel পাঠাও।");
-  }
-
-  if (pendingBatches.has(userId)) {
-    return ctx.reply(
-      "⚠️ একটি Batch-এর কাজ ইতিমধ্যে চলছে।\n" +
-      "আগে সেটি সম্পন্ন করো অথবা বাতিল করো।"
-    );
-  }
-
-  pendingBatches.set(userId, {
-    files: [],
-    status: "collecting",
-    createdAt: Date.now(),
-    inProgress: false
-  });
-
-  return ctx.reply(
-    "📦 Batch Upload শুরু হয়েছে!\n\n" +
-    "এখন একে একে তোমার ফাইলগুলো পাঠাও।\n" +
-    "সব ফাইল পাঠানো হলে /finishbatch পাঠাও।\n\n" +
-    "❌ বাতিল করতে /cancelbatch পাঠাও।"
-  );
+  return startBatchFlow(ctx);
 });
 
 // Review batch
