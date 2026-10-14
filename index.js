@@ -76,6 +76,17 @@ async function getBotSettings() {
         startText: DEFAULT_START_TEXT,
         startPhotoFileId: null,
         startButtons: [],
+        forceSubChannels: [],
+        forceSubMessage: "⚠️ {mention} দয়া করে সব channel-এ join করুন।\nবাকি channel: {count}",
+        autoDeleteEnabled: false,
+        autoDeleteMinutes: 5,
+        autoDeleteMessage: "⏳ এই ফাইলটি {time} মিনিট পরে মুছে ফেলা হবে।",
+        noForwardEnabled: false,
+        protectContentEnabled: false,
+        customCaptionEnabled: false,
+        customCaption: "{caption}",
+        customButtons: [],
+        linkShortener: { enabled: false, name: "", apiUrl: "", apiKey: "" },
         createdAt: new Date()
       }
     },
@@ -91,12 +102,19 @@ async function getBotSettings() {
       : DEFAULT_START_TEXT,
     startPhotoFileId: settings?.startPhotoFileId || null,
     startButtons: Array.isArray(settings?.startButtons)
-      ? settings.startButtons.filter((button) =>
-          button &&
-          typeof button.text === "string" &&
-          typeof button.url === "string"
-        )
-      : []
+      ? settings.startButtons.filter((button) => button && typeof button.text === "string" && typeof button.url === "string")
+      : [],
+    forceSubChannels: Array.isArray(settings?.forceSubChannels) ? settings.forceSubChannels : [],
+    forceSubMessage: typeof settings?.forceSubMessage === "string" ? settings.forceSubMessage : "⚠️ {mention} দয়া করে সব channel-এ join করুন।\nবাকি channel: {count}",
+    autoDeleteEnabled: settings?.autoDeleteEnabled === true,
+    autoDeleteMinutes: Number.isInteger(settings?.autoDeleteMinutes) && settings.autoDeleteMinutes > 0 ? Math.min(settings.autoDeleteMinutes, 10080) : 5,
+    autoDeleteMessage: typeof settings?.autoDeleteMessage === "string" ? settings.autoDeleteMessage : "⏳ এই ফাইলটি {time} মিনিট পরে মুছে ফেলা হবে।",
+    noForwardEnabled: settings?.noForwardEnabled === true,
+    protectContentEnabled: settings?.protectContentEnabled === true,
+    customCaptionEnabled: settings?.customCaptionEnabled === true,
+    customCaption: typeof settings?.customCaption === "string" ? settings.customCaption : "{caption}",
+    customButtons: Array.isArray(settings?.customButtons) ? settings.customButtons.filter((button) => button && typeof button.text === "string" && typeof button.url === "string").slice(0, 20) : [],
+    linkShortener: settings?.linkShortener && typeof settings.linkShortener === "object" ? { enabled: settings.linkShortener.enabled === true, name: settings.linkShortener.name || "", apiUrl: settings.linkShortener.apiUrl || "", apiKey: settings.linkShortener.apiKey || "" } : { enabled: false, name: "", apiUrl: "", apiKey: "" }
   };
 }
 
@@ -162,6 +180,13 @@ function adminPanelKeyboard() {
 function settingsMenuKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("📝 Start Message", "settings_start_message")],
+    [Markup.button.callback("📢 Force Subscribe", "settings_force_sub")],
+    [Markup.button.callback("⏱️ Auto Delete", "settings_auto_delete")],
+    [Markup.button.callback("🚫 No Forward", "settings_no_forward")],
+    [Markup.button.callback("🛡️ Protect Content", "settings_protect_content")],
+    [Markup.button.callback("✍️ Custom Caption", "settings_custom_caption")],
+    [Markup.button.callback("🔘 Custom Button", "settings_custom_button")],
+    [Markup.button.callback("🔗 Link Shortener", "settings_link_shortener")],
     [Markup.button.callback("⬅️ Admin Panel", "admin_back")]
   ]);
 }
@@ -215,6 +240,148 @@ async function showStartMessageSettings(ctx, edit = false) {
   });
 }
 
+function escapeHtml(value = "") {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function getMessageFileMeta(message) {
+  const media = message.document || message.video || message.audio || message.animation || message.voice || message.video_note || (message.photo && message.photo[message.photo.length - 1]) || null;
+  return {
+    fileName: message.document?.file_name || message.video?.file_name || message.audio?.file_name || message.animation?.file_name || "",
+    fileSize: media?.file_size || 0,
+    caption: message.caption || ""
+  };
+}
+
+function renderCustomCaption(template, file) {
+  const original = file.caption || "";
+  const name = file.fileName || "";
+  const size = Number(file.fileSize) || 0;
+  const sizeText = size >= 1024 * 1024 ? `${(size / (1024 * 1024)).toFixed(2)} MB` : size >= 1024 ? `${(size / 1024).toFixed(1)} KB` : size ? `${size} B` : "Unknown";
+  return String(template || "{caption}")
+    .replace(/\{file_name\}/g, name)
+    .replace(/\{file_size\}/g, sizeText)
+    .replace(/\{caption\}/g, original)
+    .slice(0, 1024);
+}
+
+function makeDeliveryOptions(file, settings) {
+  const options = {
+    protect_content: Boolean(file.protectContent || settings.noForwardEnabled || settings.protectContentEnabled)
+  };
+  if (settings.customCaptionEnabled && file.fileType !== "voice" && file.fileType !== "video_note") {
+    options.caption = renderCustomCaption(settings.customCaption, file);
+  }
+  if (settings.customButtons.length) {
+    options.reply_markup = Markup.inlineKeyboard(
+      settings.customButtons.slice(0, 20).map((button) => [Markup.button.url(button.text, button.url)])
+    ).reply_markup;
+  }
+  return options;
+}
+
+async function scheduleDelete(ctx, message, minutes) {
+  if (!message?.message_id || !ctx.chat?.id || !Number.isFinite(minutes) || minutes <= 0) return;
+  const chatId = ctx.chat.id;
+  const messageId = message.message_id;
+  const delay = Math.min(minutes, 10080) * 60 * 1000;
+  const deleteAt = new Date(Date.now() + delay);
+
+  // Persist delete tasks so they can be recovered after a Render restart/sleep.
+  if (db) {
+    try {
+      await db.collection("scheduledDeletes").insertOne({ chatId, messageId, deleteAt, createdAt: new Date() });
+    } catch (error) {
+      console.error("Persist auto-delete task error:", error.message);
+    }
+  }
+
+  setTimeout(async () => {
+    try { await ctx.telegram.deleteMessage(chatId, messageId); }
+    catch (error) { console.error("Auto-delete error:", error.message); }
+    if (db) {
+      try { await db.collection("scheduledDeletes").deleteOne({ chatId, messageId }); }
+      catch (error) { console.error("Clear auto-delete task error:", error.message); }
+    }
+  }, delay).unref?.();
+}
+
+async function processDueDeletes() {
+  if (!db) return;
+  const due = await db.collection("scheduledDeletes")
+    .find({ deleteAt: { $lte: new Date() } })
+    .sort({ deleteAt: 1 })
+    .limit(100)
+    .toArray();
+
+  for (const task of due) {
+    try {
+      await bot.telegram.deleteMessage(task.chatId, task.messageId);
+    } catch (error) {
+      // It may already have been deleted or become too old to delete.
+      console.error("Recovered auto-delete error:", error.message);
+    } finally {
+      await db.collection("scheduledDeletes").deleteOne({ _id: task._id });
+    }
+  }
+}
+
+async function sendDeliveredCopy(ctx, file) {
+  const settings = await getBotSettings();
+  const options = makeDeliveryOptions(file, settings);
+  const sent = await ctx.telegram.copyMessage(ctx.chat.id, file.storageChannelId, file.storageMessageId, options);
+  if (settings.autoDeleteEnabled) {
+    const noticeText = settings.autoDeleteMessage.replace(/\{time\}/g, String(settings.autoDeleteMinutes));
+    const notice = await ctx.reply(noticeText);
+    await scheduleDelete(ctx, sent, settings.autoDeleteMinutes);
+    await scheduleDelete(ctx, notice, settings.autoDeleteMinutes);
+  }
+  return sent;
+}
+
+function forceSubKeyboard(channels) {
+  const rows = channels.map((channel, index) => [Markup.button.url(`📢 Join Channel ${index + 1}`, channel.joinUrl)]);
+  rows.push([Markup.button.callback("✅ আমি Join করেছি — Check", "force_sub_check")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function getMissingForceSubChannels(ctx, settings) {
+  if (!settings.forceSubChannels.length || ctx.from?.id === ADMIN_ID) return [];
+  const missing = [];
+  for (const channel of settings.forceSubChannels) {
+    try {
+      const member = await ctx.telegram.getChatMember(channel.chatId, ctx.from.id);
+      if (!["creator", "administrator", "member"].includes(member.status) && !(member.status === "restricted" && member.is_member)) missing.push(channel);
+    } catch (error) {
+      console.error("Force-sub membership check error:", error.message);
+      missing.push(channel);
+    }
+  }
+  return missing;
+}
+
+async function enforceForceSub(ctx, next) {
+  if (!ctx.from || ctx.from.id === ADMIN_ID || ctx.chat?.type !== "private") return next();
+  if (ctx.callbackQuery?.data === "force_sub_check") return next();
+  try {
+    const settings = await getBotSettings();
+    const missing = await getMissingForceSubChannels(ctx, settings);
+    if (!missing.length) return next();
+    const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || "বন্ধু";
+    const text = settings.forceSubMessage
+      .replace(/\{mention\}/g, escapeHtml(name))
+      .replace(/\{count\}/g, String(missing.length));
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery("আগে সব channel-এ join করুন।", { show_alert: true }).catch(() => {});
+      return;
+    }
+    return ctx.reply(text, forceSubKeyboard(missing));
+  } catch (error) {
+    console.error("Force-sub enforcement error:", error.message);
+    return next();
+  }
+}
+
 bot.use(async (ctx, next) => {
   try {
     if (db && ctx.from && ctx.chat?.type === "private") {
@@ -245,6 +412,8 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
+bot.use(enforceForceSub);
+
 // Telegram /start and share-link delivery
 bot.start(async (ctx) => {
   const payload = ctx.startPayload;
@@ -269,11 +438,12 @@ bot.start(async (ctx) => {
         return ctx.reply("❌ ফাইলটি পাওয়া যায়নি।");
       }
 
-      await ctx.telegram.copyMessage(
-        ctx.chat.id,
-        file.storageChannelId,
-        file.storageMessageId
-      );
+      await sendDeliveredCopy(ctx, {
+        ...file,
+        fileName: file.fileName || "",
+        fileSize: file.fileSize || 0,
+        caption: file.caption || ""
+      });
     } catch (error) {
       console.error("File delivery error:", error.message);
       await ctx.reply("❌ ফাইল পাঠানো যায়নি। পরে আবার চেষ্টা করুন।");
@@ -318,11 +488,12 @@ bot.start(async (ctx) => {
       );
 
       for (const file of batch.files) {
-        await ctx.telegram.copyMessage(
-          ctx.chat.id,
-          file.storageChannelId,
-          file.storageMessageId
-        );
+        await sendDeliveredCopy(ctx, {
+          ...file,
+          fileName: file.fileName || "",
+          fileSize: file.fileSize || 0,
+          caption: file.caption || ""
+        });
       }
     } catch (error) {
       console.error("Batch delivery error:", error.message);
@@ -396,6 +567,139 @@ bot.action("settings_start_message", async (ctx) => {
     console.error("Start message settings menu error:", error.message);
     return ctx.reply("❌ Start Message menu খোলা যায়নি। আবার চেষ্টা করো।");
   }
+});
+
+function settingsBackKeyboard() {
+  return Markup.inlineKeyboard([[Markup.button.callback("⬅️ Settings", "settings_back")]]);
+}
+
+async function showForceSubSettings(ctx) {
+  const s = await getBotSettings();
+  return ctx.editMessageText(
+    "<b>Force Sub</b>\n\n<i>Users can only use your bot after joining all force sub channels. Add channels below. For private channels, provide a join URL.</i>\n\n" +
+    `Channels: ${s.forceSubChannels.length}\n\n` +
+    "<i>Custom message placeholders: {mention}, {count}</i>",
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback("➕ Add Channel", "force_sub_add_channel")],
+      [Markup.button.callback("🗑️ Remove Channel", "force_sub_remove_channel")],
+      [Markup.button.callback("💬 Message", "force_sub_message")],
+      [Markup.button.callback("⬅️ Settings", "settings_back")]
+    ]) }
+  );
+}
+
+async function showAutoDeleteSettings(ctx) {
+  const s = await getBotSettings();
+  return ctx.editMessageText(
+    "<b>Auto Delete</b>\n\n<i>Automatically delete messages sent to users after the selected number of minutes.</i>\n\n" +
+    `Status: ${s.autoDeleteEnabled ? "Enabled ✅" : "Disabled ❌"}\nTime: ${s.autoDeleteMinutes} minute(s)`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback("⏱️ Change Time", "auto_delete_time")],
+      [Markup.button.callback("💬 Message", "auto_delete_message")],
+      [Markup.button.callback(s.autoDeleteEnabled ? "❌ Disable" : "✅ Enable", "auto_delete_toggle")],
+      [Markup.button.callback("⬅️ Settings", "settings_back")]
+    ]) }
+  );
+}
+
+async function showSimpleToggle(ctx, key, title, description, callback) {
+  const s = await getBotSettings();
+  const enabled = s[key] === true;
+  return ctx.editMessageText(
+    `<b>${title}</b>\n\n${description}\n\nStatus: ${enabled ? "Enabled ✅" : "Disabled ❌"}`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback(enabled ? "❌ Disable" : "✅ Enable", callback)],
+      [Markup.button.callback("⬅️ Settings", "settings_back")]
+    ]) }
+  );
+}
+
+async function showCustomCaptionSettings(ctx) {
+  const s = await getBotSettings();
+  return ctx.editMessageText(
+    "<b>Custom Caption</b>\n\n<i>Use placeholders in captions:</i>\n• <code>{file_name}</code> — File Name\n• <code>{file_size}</code> — File size\n• <code>{caption}</code> — Original Caption\n\n" +
+    `Status: ${s.customCaptionEnabled ? "Enabled ✅" : "Disabled ❌"}\n\nCurrent template:\n${escapeHtml(s.customCaption)}` ,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback("✏️ Add / Change Caption", "custom_caption_edit")],
+      [Markup.button.callback(s.customCaptionEnabled ? "❌ Disable" : "✅ Enable", "custom_caption_toggle")],
+      [Markup.button.callback("⬅️ Settings", "settings_back")]
+    ]) }
+  );
+}
+
+async function showCustomButtonsSettings(ctx) {
+  const s = await getBotSettings();
+  const list = s.customButtons.length ? s.customButtons.map((b, i) => `${i + 1}. ${escapeHtml(b.text)} — ${escapeHtml(b.url)}`).join("\n") : "এখনো কোনো custom button নেই।";
+  return ctx.editMessageText(
+    "<b>Custom Button</b>\n\n<i>You can add custom URL buttons under delivered file messages.</i>\n\n" + list,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback("➕ Add Button", "custom_button_add")],
+      [Markup.button.callback("🗑️ Delete Button", "custom_button_delete")],
+      [Markup.button.callback("⬅️ Settings", "settings_back")]
+    ]) }
+  );
+}
+
+async function showShortenerSettings(ctx) {
+  const s = await getBotSettings();
+  const x = s.linkShortener;
+  return ctx.editMessageText(
+    "<b>Link Shortener</b>\n\n<i>Connect a provider using an API URL template. Use {url} for the original URL and {api_key} for the API key if required.</i>\n\n" +
+    `Provider: ${escapeHtml(x.name || "Not configured")}\nStatus: ${x.enabled ? "Enabled ✅" : "Disabled ❌"}`,
+    { parse_mode: "HTML", ...Markup.inlineKeyboard([
+      [Markup.button.callback("➕ Add / Change Shortener", "shortener_setup")],
+      [Markup.button.callback("🗑️ Remove Shortener", "shortener_remove")],
+      [Markup.button.callback(x.enabled ? "❌ Disable" : "✅ Enable", "shortener_toggle")],
+      [Markup.button.callback("⬅️ Settings", "settings_back")]
+    ]) }
+  );
+}
+
+bot.action("settings_force_sub", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showForceSubSettings(ctx); });
+bot.action("settings_auto_delete", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showAutoDeleteSettings(ctx); });
+bot.action("settings_no_forward", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showSimpleToggle(ctx, "noForwardEnabled", "No Forward", "Restrict forwarding of messages sent through share links.", "no_forward_toggle"); });
+bot.action("settings_protect_content", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showSimpleToggle(ctx, "protectContentEnabled", "Protect Content", "Enable: forwarding is blocked for new links and deliveries. Existing links retain their per-link protection. Disable: protection follows the No Forward setting.", "protect_content_toggle"); });
+bot.action("settings_custom_caption", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showCustomCaptionSettings(ctx); });
+bot.action("settings_custom_button", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showCustomButtonsSettings(ctx); });
+bot.action("settings_link_shortener", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showShortenerSettings(ctx); });
+
+function setAdminInput(ctx, state, prompt) {
+  adminInputStates.set(ctx.from.id, state);
+  return ctx.reply(prompt + "\n\nবাতিল করতে /cancel পাঠাও।");
+}
+
+bot.action("force_sub_add_channel", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return setAdminInput(ctx, { type: "force_sub_channel" }, "Channel username/ID পাঠাও। Public channel হলে @channelname, private হলে -100... ID | https://t.me/+invite-link এই format ব্যবহার করো।"); });
+bot.action("force_sub_remove_channel", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  const s = await getBotSettings();
+  if (!s.forceSubChannels.length) { await ctx.answerCbQuery("কোনো channel নেই।", { show_alert: true }); return; }
+  await ctx.answerCbQuery();
+  return setAdminInput(ctx, { type: "force_sub_remove_channel" }, "কোন channel মুছবে? নম্বর পাঠাও:\n" + s.forceSubChannels.map((c, i) => `${i + 1}. ${c.chatId}`).join("\n"));
+});
+bot.action("force_sub_message", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return setAdminInput(ctx, { type: "force_sub_message" }, "Custom Force Sub Message পাঠাও। Placeholder: {mention}, {count}"); });
+bot.action("auto_delete_time", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return setAdminInput(ctx, { type: "auto_delete_time" }, "Auto Delete time মিনিটে পাঠাও (1–10080)।"); });
+bot.action("auto_delete_message", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return setAdminInput(ctx, { type: "auto_delete_message" }, "Auto Delete alert message পাঠাও। {time} placeholder ব্যবহার করতে পারো।"); });
+bot.action("auto_delete_toggle", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); const s = await getBotSettings(); await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { autoDeleteEnabled: !s.autoDeleteEnabled, updatedAt: new Date() } }); await ctx.answerCbQuery("Updated"); return showAutoDeleteSettings(ctx); });
+bot.action("no_forward_toggle", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); const s = await getBotSettings(); await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { noForwardEnabled: !s.noForwardEnabled, updatedAt: new Date() } }); await ctx.answerCbQuery("Updated"); return showSimpleToggle(ctx, "noForwardEnabled", "No Forward", "Restrict forwarding of messages sent through share links.", "no_forward_toggle"); });
+bot.action("protect_content_toggle", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); const s = await getBotSettings(); await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { protectContentEnabled: !s.protectContentEnabled, updatedAt: new Date() } }); await ctx.answerCbQuery("Updated"); return showSimpleToggle(ctx, "protectContentEnabled", "Protect Content", "Enable: forwarding is blocked for new links and deliveries. Existing links retain their per-link protection. Disable: protection follows the No Forward setting.", "protect_content_toggle"); });
+bot.action("custom_caption_edit", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return setAdminInput(ctx, { type: "custom_caption" }, "Custom caption template পাঠাও। Placeholder: {file_name}, {file_size}, {caption}"); });
+bot.action("custom_caption_toggle", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); const s = await getBotSettings(); await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { customCaptionEnabled: !s.customCaptionEnabled, updatedAt: new Date() } }); await ctx.answerCbQuery("Updated"); return showCustomCaptionSettings(ctx); });
+bot.action("custom_button_add", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return setAdminInput(ctx, { type: "custom_button_title" }, "নতুন custom button-এর নাম পাঠাও।"); });
+bot.action("custom_button_delete", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); const s = await getBotSettings(); if (!s.customButtons.length) { await ctx.answerCbQuery("কোনো button নেই।", { show_alert: true }); return; } await ctx.answerCbQuery(); return setAdminInput(ctx, { type: "custom_button_delete" }, "যে button মুছবে তার নম্বর পাঠাও:\n" + s.customButtons.map((b, i) => `${i + 1}. ${b.text}`).join("\n")); });
+bot.action("shortener_setup", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return setAdminInput(ctx, { type: "shortener_name" }, "Provider-এর নাম পাঠাও (যেমন provider name)।"); });
+bot.action("shortener_remove", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { linkShortener: { enabled: false, name: "", apiUrl: "", apiKey: "" }, updatedAt: new Date() } }); await ctx.answerCbQuery("Removed"); return showShortenerSettings(ctx); });
+bot.action("shortener_toggle", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); const s = await getBotSettings(); const next = !s.linkShortener.enabled; if (next && !s.linkShortener.apiUrl) return ctx.answerCbQuery("আগে provider configure করো।", { show_alert: true }); await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { "linkShortener.enabled": next, updatedAt: new Date() } }); await ctx.answerCbQuery("Updated"); return showShortenerSettings(ctx); });
+
+bot.action("force_sub_check", async (ctx) => {
+  if (!isAdmin(ctx)) {
+    try {
+      const settings = await getBotSettings();
+      const missing = await getMissingForceSubChannels(ctx, settings);
+      if (missing.length) return ctx.answerCbQuery("এখনো সব channel-এ join করা হয়নি।", { show_alert: true });
+    } catch (error) { return ctx.answerCbQuery("Check করা যায়নি।", { show_alert: true }); }
+  }
+  await ctx.answerCbQuery("Subscription verified.");
+  return sendConfiguredStartMessage(ctx);
 });
 
 bot.action("settings_back", async (ctx) => {
@@ -598,6 +902,77 @@ bot.on("text", async (ctx, next) => {
     }
   }
 
+  if (state.type === "force_sub_channel") {
+    const parts = value.split("|").map((x) => x.trim());
+    const chatId = parts[0];
+    const joinUrl = parts[1] || (chatId.startsWith("@") ? `https://t.me/${chatId.slice(1)}` : "");
+    if (!chatId || !joinUrl || !/^https?:\/\//i.test(joinUrl)) return ctx.reply("⚠️ Channel input ঠিক নয়। @username অথবা -100... ID | https://t.me/invite-link পাঠাও।");
+    try {
+      await ctx.telegram.getChat(chatId);
+      await db.collection("settings").updateOne({ _id: "botSettings" }, { $addToSet: { forceSubChannels: { chatId, joinUrl } }, $set: { updatedAt: new Date() } }, { upsert: true });
+      adminInputStates.delete(ctx.from.id);
+      await ctx.reply("✅ Force Subscribe channel যোগ হয়েছে। Bot-কে ওই channel-এ administrator করতে হবে যেন membership check করতে পারে।");
+      return showForceSubSettings(ctx);
+    } catch (error) { return ctx.reply("❌ Channel যাচাই করা যায়নি। Bot-কে channel-এ add/admin করে সঠিক @username বা ID পাঠাও।"); }
+  }
+  if (state.type === "force_sub_remove_channel") {
+    const s = await getBotSettings(); const index = Number(value) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= s.forceSubChannels.length) return ctx.reply("সঠিক channel নম্বর পাঠাও।");
+    const channel = s.forceSubChannels[index];
+    await db.collection("settings").updateOne({ _id: "botSettings" }, { $pull: { forceSubChannels: { chatId: channel.chatId } }, $set: { updatedAt: new Date() } });
+    adminInputStates.delete(ctx.from.id); await ctx.reply("✅ Channel remove হয়েছে।"); return showForceSubSettings(ctx);
+  }
+  if (state.type === "force_sub_message" || state.type === "auto_delete_message") {
+    const key = state.type === "force_sub_message" ? "forceSubMessage" : "autoDeleteMessage";
+    await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { [key]: value, updatedAt: new Date() } }, { upsert: true });
+    adminInputStates.delete(ctx.from.id); await ctx.reply("✅ Message save হয়েছে।");
+    if (state.type === "force_sub_message") return showForceSubSettings(ctx);
+    return showAutoDeleteSettings(ctx);
+  }
+  if (state.type === "auto_delete_time") {
+    const minutes = Number(value);
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > 10080) return ctx.reply("১ থেকে ১০০৮০-এর মধ্যে পূর্ণ মিনিট পাঠাও।");
+    await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { autoDeleteMinutes: minutes, updatedAt: new Date() } }, { upsert: true });
+    adminInputStates.delete(ctx.from.id); await ctx.reply("✅ Auto Delete time update হয়েছে।"); return showAutoDeleteSettings(ctx);
+  }
+  if (state.type === "custom_caption") {
+    if (value.length > 1024) return ctx.reply("Caption template সর্বোচ্চ ১০২৪ অক্ষর হতে পারবে।");
+    await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { customCaption: value, customCaptionEnabled: true, updatedAt: new Date() } }, { upsert: true });
+    adminInputStates.delete(ctx.from.id); await ctx.reply("✅ Custom Caption save ও enable হয়েছে।"); return showCustomCaptionSettings(ctx);
+  }
+  if (state.type === "custom_button_title") {
+    if (!value || value.length > 64) return ctx.reply("Button-এর নাম ১–৬৪ অক্ষরের মধ্যে দাও।");
+    adminInputStates.set(ctx.from.id, { type: "custom_button_url", buttonText: value });
+    return ctx.reply("এখন button-এর website URL পাঠাও (https:// দিয়ে শুরু হবে)।");
+  }
+  if (state.type === "custom_button_url") {
+    let u; try { u = new URL(value); } catch { return ctx.reply("সঠিক URL পাঠাও, যেমন https://example.com"); }
+    if (!['http:', 'https:'].includes(u.protocol)) return ctx.reply("শুধু http/https URL ব্যবহার করা যাবে।");
+    const s = await getBotSettings(); if (s.customButtons.length >= 20) { adminInputStates.delete(ctx.from.id); return ctx.reply("সর্বোচ্চ ২০টি custom button রাখা যাবে।"); }
+    await db.collection("settings").updateOne({ _id: "botSettings" }, { $push: { customButtons: { text: state.buttonText, url: u.toString() } }, $set: { updatedAt: new Date() } }, { upsert: true });
+    adminInputStates.delete(ctx.from.id); await ctx.reply("✅ Custom Button যোগ হয়েছে।"); return showCustomButtonsSettings(ctx);
+  }
+  if (state.type === "custom_button_delete") {
+    const s = await getBotSettings(); const index = Number(value) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= s.customButtons.length) return ctx.reply("সঠিক button নম্বর পাঠাও।");
+    const buttons = s.customButtons.filter((_, i) => i !== index);
+    await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { customButtons: buttons, updatedAt: new Date() } });
+    adminInputStates.delete(ctx.from.id); await ctx.reply("✅ Button delete হয়েছে।"); return showCustomButtonsSettings(ctx);
+  }
+  if (state.type === "shortener_name") {
+    adminInputStates.set(ctx.from.id, { type: "shortener_api_url", name: value });
+    return ctx.reply("Provider-এর API URL template পাঠাও। {url} এবং দরকার হলে {api_key} placeholder ব্যবহার করো। উদাহরণ: https://provider.example/api?key={api_key}&url={url}");
+  }
+  if (state.type === "shortener_api_url") {
+    if (!value.startsWith("https://") || !value.includes("{url}")) return ctx.reply("HTTPS API URL এবং {url} placeholder থাকা দরকার।");
+    adminInputStates.set(ctx.from.id, { type: "shortener_api_key", name: state.name, apiUrl: value });
+    return ctx.reply("Provider API key পাঠাও। API key না লাগলে NONE পাঠাও।");
+  }
+  if (state.type === "shortener_api_key") {
+    const apiKey = value.toUpperCase() === "NONE" ? "" : value;
+    await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { linkShortener: { name: state.name, apiUrl: state.apiUrl, apiKey, enabled: false }, updatedAt: new Date() } }, { upsert: true });
+    adminInputStates.delete(ctx.from.id); await ctx.reply("✅ Provider save হয়েছে। এখন Link Shortener menu থেকে Enable করো। Provider-এর API response format অনুযায়ী পরীক্ষা করতে হবে।"); return showShortenerSettings(ctx);
+  }
   return next();
 });
 
@@ -737,7 +1112,7 @@ bot.on(
         chatId: ctx.chat.id,
         messageId: ctx.message.message_id,
         fileType,
-        caption: ctx.message.caption || ""
+        ...getMessageFileMeta(ctx.message)
       });
 
       return ctx.reply(
@@ -770,6 +1145,7 @@ bot.on(
       messageId: ctx.message.message_id,
       fileType,
       caption: ctx.message.caption || "",
+      ...getMessageFileMeta(ctx.message),
       createdAt: Date.now()
     });
 
@@ -841,6 +1217,23 @@ bot.action("genlink_cancel", async (ctx) => {
   );
 });
 
+async function shortenUrl(originalUrl) {
+  const settings = await getBotSettings();
+  const provider = settings.linkShortener;
+  if (!provider.enabled || !provider.apiUrl) return originalUrl;
+  const apiUrl = provider.apiUrl.replace(/\{api_key\}/g, encodeURIComponent(provider.apiKey || "")).replace(/\{url\}/g, encodeURIComponent(originalUrl));
+  const response = await fetch(apiUrl, { method: "GET", signal: AbortSignal.timeout(10000) });
+  if (!response.ok) throw new Error(`Shortener HTTP ${response.status}`);
+  const body = await response.text();
+  let result = body.trim();
+  try {
+    const json = JSON.parse(body);
+    result = json.shortenedUrl || json.short_url || json.shorturl || json.shortUrl || json.url || json.data?.url || json.data?.short_url || "";
+  } catch {}
+  if (!/^https?:\/\//i.test(result)) throw new Error("Unrecognized shortener API response");
+  return result;
+}
+
 // Confirm single-file storage
 bot.action("genlink_confirm", async (ctx) => {
   if (!isAdmin(ctx)) {
@@ -893,11 +1286,16 @@ bot.action("genlink_confirm", async (ctx) => {
       storageMessageId: copied.message_id,
       uploadedBy: userId,
       caption: pending.caption || "",
+      fileName: pending.fileName || "",
+      fileSize: pending.fileSize || 0,
+      protectContent: (await getBotSettings()).protectContentEnabled,
       createdAt: new Date()
     });
 
     const me = await ctx.telegram.getMe();
-    const link = `https://t.me/${me.username}?start=file_${result.insertedId}`;
+    let link = `https://t.me/${me.username}?start=file_${result.insertedId}`;
+    try { link = await shortenUrl(link); }
+    catch (shortError) { console.error("Link shortener error:", shortError.message); }
 
     pendingFiles.delete(userId);
 
@@ -1123,6 +1521,7 @@ bot.action("batch_confirm", async (ctx) => {
     const me = await ctx.telegram.getMe();
 
     if (!batch.databaseId) {
+      const currentSettings = await getBotSettings();
       const result = await collection.insertOne({
         uploadedBy: userId,
         status: "processing",
@@ -1130,7 +1529,10 @@ bot.action("batch_confirm", async (ctx) => {
           chatId: file.chatId,
           messageId: file.messageId,
           fileType: file.fileType,
-          caption: file.caption || ""
+          caption: file.caption || "",
+          fileName: file.fileName || "",
+          fileSize: file.fileSize || 0,
+          protectContent: currentSettings.protectContentEnabled
         })),
         files: [],
         storedCount: 0,
@@ -1151,7 +1553,8 @@ bot.action("batch_confirm", async (ctx) => {
     }
 
     if (savedBatch.status === "ready") {
-      const link = `https://t.me/${me.username}?start=batch_${batchId}`;
+      let link = `https://t.me/${me.username}?start=batch_${batchId}`;
+      try { link = await shortenUrl(link); } catch (shortError) { console.error("Link shortener error:", shortError.message); }
       pendingBatches.delete(userId);
 
       try {
@@ -1205,7 +1608,10 @@ bot.action("batch_confirm", async (ctx) => {
         fileType: file.fileType,
         storageChannelId: String(STORAGE_CHANNEL_ID),
         storageMessageId: copied.message_id,
-        caption: file.caption || ""
+        caption: file.caption || "",
+        fileName: file.fileName || "",
+        fileSize: file.fileSize || 0,
+        protectContent: (await getBotSettings()).protectContentEnabled
       };
 
       const updateResult = await collection.updateOne(
@@ -1268,7 +1674,8 @@ bot.action("batch_confirm", async (ctx) => {
       throw new Error("Batch could not be marked ready");
     }
 
-    const link = `https://t.me/${me.username}?start=batch_${batchId}`;
+    let link = `https://t.me/${me.username}?start=batch_${batchId}`;
+    try { link = await shortenUrl(link); } catch (shortError) { console.error("Link shortener error:", shortError.message); }
     pendingBatches.delete(userId);
 
     try {
