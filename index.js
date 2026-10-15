@@ -1651,7 +1651,7 @@ bot.action("genlink_confirm", async (ctx) => {
     });
 
     const me = await ctx.telegram.getMe();
-    let link = `https://t.me/${me.username}?start=file_${result.insertedId}`;
+    let link = `https://telefile4your.blogspot.com?start=file_${result.insertedId}`;
     try { link = await shortenUrl(link); }
     catch (shortError) { console.error("Link shortener error:", shortError.message); }
 
