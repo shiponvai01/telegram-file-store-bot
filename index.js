@@ -234,13 +234,63 @@ function bytesToText(bytes) {
   return `${value} B`;
 }
 
+function isExpiredPaidUser(user, now = new Date()) {
+  return user?.plan === "premium" && Boolean(user?.subscriptionExpiresAt) && new Date(user.subscriptionExpiresAt) <= now;
+}
+
 function getUserPlan(user) {
   return user?.plan === "premium" && user?.subscriptionStatus === "active" && (!user.subscriptionExpiresAt || new Date(user.subscriptionExpiresAt) > new Date()) ? "premium" : "free";
 }
 
+function getSubscriptionLabel(user) {
+  if (isExpiredPaidUser(user)) return "Expired ⌛";
+  return getUserPlan(user) === "premium" ? "Paid ⭐" : "Free 🆓";
+}
+
 function getPlanLimits(user, settings) {
   const plan = getUserPlan(user);
-  return { plan, ...settings.subscriptionPlans[plan] };
+  const base = settings.subscriptionPlans[plan];
+  const storageBytes = Number(user?.customStorageLimitBytes) > 0 ? Number(user.customStorageLimitBytes) : base.storageBytes;
+  const fileLimit = Number(user?.customFileLimit) > 0 ? Number(user.customFileLimit) : base.fileLimit;
+  return { plan, storageBytes, fileLimit, ...(plan === "premium" ? { durationDays: base.durationDays } : {}) };
+}
+
+// Quota usage includes personal files and user-created share-link batches.
+// Admin-created batches are excluded from member quotas.
+async function getQuotaUsage(user) {
+  const userId = Number(user?.telegramId);
+  const batchTotals = await db.collection("batches").aggregate([
+    { $match: { uploadedBy: userId, countsTowardQuota: true } },
+    { $group: {
+      _id: null,
+      fileCount: { $sum: { $ifNull: ["$quotaFileCount", 0] } },
+      storageBytes: { $sum: { $ifNull: ["$quotaStorageBytes", 0] } }
+    } }
+  ]).toArray();
+  return {
+    fileCount: Math.max(0, Number(user?.personalFileCount) || 0) + Math.max(0, Number(batchTotals[0]?.fileCount) || 0),
+    storageBytes: Math.max(0, Number(user?.storageUsedBytes) || 0) + Math.max(0, Number(batchTotals[0]?.storageBytes) || 0)
+  };
+}
+
+async function validateBatchQuota(ctx, batch) {
+  if (isAdmin(ctx)) return null;
+  const user = await ensureUser(ctx.from);
+  if (!user) return "❌ User তথ্য পাওয়া যায়নি। আবার /batch দিয়ে চেষ্টা করুন।";
+  if (user.banned) return "⛔ আপনার account block করা হয়েছে।";
+  if (isExpiredPaidUser(user)) return "⌛ আপনার Paid Subscription-এর মেয়াদ শেষ। পুরোনো ফাইল পাওয়া যাবে, কিন্তু নতুন Batch Upload বন্ধ। Renew করতে Admin-এর সঙ্গে যোগাযোগ করুন।";
+  const settings = await getBotSettings();
+  const limits = getPlanLimits(user, settings);
+  const usage = await getQuotaUsage(user);
+  const newFileCount = Array.isArray(batch?.files) ? batch.files.length : 0;
+  const newStorageBytes = (batch?.files || []).reduce((sum, file) => sum + Math.max(0, Number(file.fileSize) || 0), 0);
+  if (usage.fileCount + newFileCount > limits.fileLimit) {
+    return `❌ File limit ছাড়িয়ে যাবে। বর্তমানে ${usage.fileCount}/${limits.fileLimit} files; এই Batch-এ ${newFileCount}টি ফাইল আছে।`;
+  }
+  if (usage.storageBytes + newStorageBytes > limits.storageBytes) {
+    return `❌ Storage limit ছাড়িয়ে যাবে। বর্তমানে ${bytesToText(usage.storageBytes)} / ${bytesToText(limits.storageBytes)}; এই Batch-এর size ${bytesToText(newStorageBytes)}।`;
+  }
+  return null;
 }
 
 async function ensureIndexes() {
@@ -347,17 +397,30 @@ async function showMyFiles(ctx) {
   const user = await ensureUser(ctx.from);
   const limits = getPlanLimits(user, settings);
   const files = await db.collection("personalFiles").find({ ownerId: ctx.from.id }).sort({ createdAt: -1 }).limit(10).toArray();
-  let text = `📁 <b>My Files</b>\n\n💎 Plan: ${limits.plan === "premium" ? "Premium ⭐" : "Free"}\n📦 Files: ${user.personalFileCount}/${limits.fileLimit}\n💾 Storage: ${bytesToText(user.storageUsedBytes)} / ${bytesToText(limits.storageBytes)}\n\n`;
+  let text = `📁 <b>My Files</b>\n\n💎 Plan: ${escapeHtml(getSubscriptionLabel(user))}\n📦 Files: ${user.personalFileCount}/${limits.fileLimit}\n💾 Storage: ${bytesToText(user.storageUsedBytes)} / ${bytesToText(limits.storageBytes)}\n\n`;
   text += files.length ? files.map((file, i) => `${i + 1}. ${escapeHtml(file.fileName || file.fileType || "File")} — ${bytesToText(file.fileSize)}`).join("\n") : "এখনো কোনো personal file নেই।";
+  const rows = [
+    [Markup.button.callback("🆔 My File IDs", "user_file_ids"), Markup.button.callback("🗑️ Delete File", "user_delete_file_prompt")],
+    [Markup.button.callback("📤 Upload File", "user_upload")],
+    [Markup.button.callback("🔗 My Links", "user_links"), Markup.button.callback("🔄 Refresh", "user_files")],
+    [Markup.button.callback("⬅️ Main Menu", "user_menu")]
+  ];
+  return ctx.reply(text, { parse_mode: "HTML", ...Markup.inlineKeyboard(rows) });
+}
+
+async function showUserFileIds(ctx, page = 0, edit = false) {
+  const pageSize = 8;
+  const filter = { ownerId: ctx.from.id };
+  const total = await db.collection("personalFiles").countDocuments(filter);
+  const maxPage = Math.max(0, Math.ceil(total / pageSize) - 1);
+  page = Math.max(0, Math.min(Number(page) || 0, maxPage));
+  const files = await db.collection("personalFiles").find(filter).sort({ createdAt: -1 }).skip(page * pageSize).limit(pageSize).toArray();
+  const body = files.length ? files.map((f, i) => `${page * pageSize + i + 1}. <b>${escapeHtml(f.fileName || f.fileType || "File")}</b> — ${bytesToText(f.fileSize)}\n🆔 <code>${f._id}</code>`).join("\n\n") : "এখনো কোনো personal file নেই।";
   const rows = [];
-  for (let i = 0; i < files.length; i += 2) {
-    const row = [Markup.button.callback(`🗑️ ${i + 1}`, `user_delete_file_${files[i]._id}`)];
-    if (files[i + 1]) row.push(Markup.button.callback(`🗑️ ${i + 2}`, `user_delete_file_${files[i + 1]._id}`));
-    rows.push(row);
-  }
-  rows.push([Markup.button.callback("📤 Upload File", "user_upload")]);
-  rows.push([Markup.button.callback("🔗 My Links", "user_links"), Markup.button.callback("🔄 Refresh", "user_files")]);
-  rows.push([Markup.button.callback("⬅️ Main Menu", "user_menu")]);
+  if (page > 0 || page < maxPage) rows.push([...(page > 0 ? [Markup.button.callback("⬅️ Previous", `user_file_ids_page_${page - 1}`)] : []), ...(page < maxPage ? [Markup.button.callback("Next ➡️", `user_file_ids_page_${page + 1}`)] : [])]);
+  rows.push([Markup.button.callback("🗑️ Delete File", "user_delete_file_prompt"), Markup.button.callback("⬅️ My Files", "user_files")]);
+  const text = `🆔 <b>My File IDs</b>\nPage ${page + 1}/${maxPage + 1} • Total: ${total}\n\n${body}\n\nএকবারে একটি File ID দিয়ে Delete করা যাবে।`;
+  if (edit) return ctx.editMessageText(text, { parse_mode: "HTML", ...Markup.inlineKeyboard(rows) });
   return ctx.reply(text, { parse_mode: "HTML", ...Markup.inlineKeyboard(rows) });
 }
 
@@ -372,9 +435,10 @@ async function showStorage(ctx) {
   const settings = await getBotSettings();
   const user = await ensureUser(ctx.from);
   const limits = getPlanLimits(user, settings);
-  const percent = Math.min(100, Math.round((Number(user.storageUsedBytes || 0) / limits.storageBytes) * 100));
+  const usage = await getQuotaUsage(user);
+  const percent = Math.min(100, Math.round((usage.storageBytes / Math.max(1, limits.storageBytes)) * 100));
   const blocks = Math.round(percent / 10);
-  return ctx.reply(`💾 <b>My Storage</b>\n\n💎 Plan: ${limits.plan === "premium" ? "Premium ⭐" : "Free"}\n📦 Files: ${user.personalFileCount}/${limits.fileLimit}\n💾 Used: ${bytesToText(user.storageUsedBytes)} / ${bytesToText(limits.storageBytes)}\n\n${"█".repeat(blocks)}${"░".repeat(10 - blocks)} ${percent}%`, { parse_mode: "HTML", ...userMainKeyboard() });
+  return ctx.reply(`💾 <b>My Storage</b>\n\n💎 Plan: ${escapeHtml(getSubscriptionLabel(user))}\n📦 Files: ${usage.fileCount}/${limits.fileLimit}\n💾 Used: ${bytesToText(usage.storageBytes)} / ${bytesToText(limits.storageBytes)}\n\n${"█".repeat(blocks)}${"░".repeat(10 - blocks)} ${percent}%\n\nBatch Share Link-এর ফাইলও আপনার quota-তে গণনা করা হয়।`, { parse_mode: "HTML", ...userMainKeyboard() });
 }
 
 async function showSubscription(ctx) {
@@ -382,14 +446,14 @@ async function showSubscription(ctx) {
   const user = await ensureUser(ctx.from);
   const plan = getUserPlan(user);
   const expiry = user.subscriptionExpiresAt ? new Date(user.subscriptionExpiresAt).toLocaleString("en-GB") : "—";
-  return ctx.reply(`💎 <b>Subscription</b>\n\nCurrent Plan: <b>${plan === "premium" ? "Premium ⭐" : "Free"}</b>\n${plan === "premium" ? `Expires: ${escapeHtml(expiry)}\n` : ""}\n🆓 Free: ${bytesToText(settings.subscriptionPlans.free.storageBytes)}, ${settings.subscriptionPlans.free.fileLimit} files\n⭐ Premium: ${bytesToText(settings.subscriptionPlans.premium.storageBytes)}, ${settings.subscriptionPlans.premium.fileLimit} files\nDuration: ${settings.subscriptionPlans.premium.durationDays} days\n\nPayment integration can be connected later. For now Admin can activate Premium manually.`, { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("📩 Contact Admin", "subscription_contact")], [Markup.button.callback("⬅️ Main Menu", "user_menu")]]) });
+  return ctx.reply(`💎 <b>Subscription</b>\n\nCurrent Status: <b>${escapeHtml(getSubscriptionLabel(user))}</b>\n${user.subscriptionExpiresAt ? `Expiry: ${escapeHtml(expiry)}\n` : ""}\n🆓 Free: ${bytesToText(settings.subscriptionPlans.free.storageBytes)}, ${settings.subscriptionPlans.free.fileLimit} files\n⭐ Paid: ${bytesToText(settings.subscriptionPlans.premium.storageBytes)}, ${settings.subscriptionPlans.premium.fileLimit} files\n\n${isExpiredPaidUser(user) ? "⌛ মেয়াদ শেষ। পুরোনো ফাইল দেখা/ডাউনলোড করা যাবে, কিন্তু নতুন Upload বন্ধ আছে। Renew করতে Admin-এর সঙ্গে যোগাযোগ করুন।" : "Paid Subscription Admin manually activate ও renew করেন।"}`, { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("📩 Contact Admin", "subscription_contact")], [Markup.button.callback("⬅️ Main Menu", "user_menu")]]) });
 }
 
 async function showAccount(ctx) {
   const settings = await getBotSettings();
   const user = await ensureUser(ctx.from);
   const limits = getPlanLimits(user, settings);
-  return ctx.reply(`👤 <b>My Account</b>\n\n🆔 ID: <code>${ctx.from.id}</code>\n👤 Username: ${ctx.from.username ? "@" + escapeHtml(ctx.from.username) : "Not set"}\n💎 Plan: ${limits.plan === "premium" ? "Premium ⭐" : "Free"}\n📦 Files: ${user.personalFileCount}\n💾 Storage: ${bytesToText(user.storageUsedBytes)} / ${bytesToText(limits.storageBytes)}`, { parse_mode: "HTML", ...userMainKeyboard() });
+  return ctx.reply(`👤 <b>My Account</b>\n\n🆔 ID: <code>${ctx.from.id}</code>\n👤 Username: ${ctx.from.username ? "@" + escapeHtml(ctx.from.username) : "Not set"}\n💎 Plan: ${escapeHtml(getSubscriptionLabel(user))}\n📦 Files: ${user.personalFileCount}/${limits.fileLimit}\n💾 Storage: ${bytesToText(user.storageUsedBytes)} / ${bytesToText(limits.storageBytes)}`, { parse_mode: "HTML", ...userMainKeyboard() });
 }
 
 function moderatorPanelKeyboard() {
@@ -602,9 +666,17 @@ async function startSingleLinkFlow(ctx) {
 }
 
 async function startBatchFlow(ctx) {
-  if (!isAdmin(ctx)) return ctx.reply("⛔ You are not authorized.");
+  if (ctx.chat?.type !== "private") return ctx.reply("📩 Batch Upload করতে Bot-এর Private Chat ব্যবহার করুন।");
+  if (!isAdmin(ctx)) {
+    const user = await ensureUser(ctx.from);
+    if (user?.banned) return ctx.reply("⛔ আপনার account block করা হয়েছে।");
+    if (isExpiredPaidUser(user)) return ctx.reply("⌛ আপনার Paid Subscription-এর মেয়াদ শেষ। পুরোনো ফাইল থাকবে, কিন্তু নতুন Batch Upload করতে Admin-এর মাধ্যমে Paid renew করতে হবে।", userMainKeyboard());
+  }
 
   const userId = ctx.from.id;
+  if (personalUploadStates.has(userId)) {
+    return ctx.reply("⚠️ আগে Personal Upload শেষ বা /cancel দিয়ে বাতিল করুন। তারপর /batch শুরু করুন।");
+  }
   if (pendingFiles.has(userId)) {
     return ctx.reply("⚠️ আগে Single Upload সম্পন্ন করো অথবা /cancel পাঠাও।");
   }
@@ -620,10 +692,12 @@ async function startBatchFlow(ctx) {
   });
 
   return ctx.reply(
-    "📦 Batch Upload শুরু হয়েছে!\n\n" +
-    "এখন একে একে তোমার ফাইলগুলো পাঠাও।\n" +
+    "📦 Multi-File Share Upload শুরু হয়েছে!\n\n" +
+    "✅ Album হিসেবে একসঙ্গে অথবা একটির পর একটি ফাইল পাঠাতে পারো।\n" +
+    "🔢 প্রতি Batch-এ সর্বোচ্চ ১০টি ফাইল।\n" +
     "সব ফাইল পাঠানো হলে /finishbatch পাঠাও।\n\n" +
-    "❌ বাতিল করতে /cancelbatch পাঠাও।"
+    "❌ বাতিল করতে /cancelbatch পাঠাও।\n" +
+    (isAdmin(ctx) ? "" : "\nতোমার Subscription, File Limit ও Storage Limit প্রযোজ্য হবে।")
   );
 }
 
@@ -960,7 +1034,7 @@ bot.command("help", async (ctx) => {
     "/admin - Open admin panel\n" +
     "/genlink - Generate a single-file link\n" +
     "/cancel - Cancel single-file upload or current admin input\n" +
-    "/batch - Start batch upload\n" +
+    "/batch - Upload up to 10 files (Album or Sequential) and create one Share Link\n" +
     "/finishbatch - Review batch files\n" +
     "/cancelbatch - Cancel batch upload\n" +
     "/myfiles - My personal files\n" +
@@ -980,7 +1054,7 @@ bot.command("storage", showStorage);
 bot.command("subscription", showSubscription);
 bot.command("mylinks", showMyLinks);
 bot.command("account", showAccount);
-bot.command("upload", async (ctx) => { personalUploadStates.set(ctx.from.id, { createdAt: Date.now() }); return ctx.reply("📤 আপনার personal storage-এ file পাঠান। /cancel দিয়ে বাতিল করুন।", userMainKeyboard()); });
+bot.command("upload", async (ctx) => { const user = await ensureUser(ctx.from); if (pendingBatches.has(ctx.from.id)) return ctx.reply("⚠️ আগে চলমান Batch শেষ করুন অথবা /cancelbatch দিয়ে বাতিল করুন।"); if (isExpiredPaidUser(user)) return ctx.reply("⌛ Paid Subscription শেষ। পুরোনো ফাইল থাকবে, কিন্তু নতুন Upload-এর জন্য Admin-এর মাধ্যমে Renew করতে হবে।", userMainKeyboard()); personalUploadStates.set(ctx.from.id, { createdAt: Date.now() }); return ctx.reply("📤 আপনার personal storage-এ file পাঠান। /cancel দিয়ে বাতিল করুন।", userMainKeyboard()); });
 bot.command("deletefile", async (ctx) => {
   const parts = String(ctx.message?.text || "").trim().split(/\s+/);
   const id = parts[1];
@@ -1000,19 +1074,10 @@ bot.hears("👤 My Account", showAccount);
 bot.hears("ℹ️ Help", (ctx) => ctx.reply("📚 Commands\n\n/start - Start\n/myfiles - My Files\n/storage - Storage\n/subscription - Subscription\n/mylinks - My Links\n/account - My Account\n/help - Help", userMainKeyboard()));
 bot.action("user_menu", async (ctx) => { await ctx.answerCbQuery(); return ctx.reply("🏠 Main Menu", userMainKeyboard()); });
 bot.action("user_files", async (ctx) => { await ctx.answerCbQuery(); return showMyFiles(ctx); });
-bot.action(/^user_delete_file_([a-f0-9]{24})$/i, async (ctx) => {
-  const id = ctx.match[1];
-  try {
-    const file = await db.collection("personalFiles").findOne({ _id: new ObjectId(id), ownerId: ctx.from.id });
-    if (!file) return ctx.answerCbQuery("File পাওয়া যায়নি।", { show_alert: true });
-    try { await ctx.telegram.deleteMessage(file.storageChannelId, file.storageMessageId); } catch (error) { console.error("User file delete storage error:", error.message); }
-    await db.collection("personalFiles").deleteOne({ _id: file._id });
-    await db.collection("users").updateOne({ telegramId: ctx.from.id, personalFileCount: { $gt: 0 } }, { $inc: { storageUsedBytes: -(Number(file.fileSize) || 0), personalFileCount: -1 }, $set: { updatedAt: new Date() } });
-    await ctx.answerCbQuery("File deleted successfully.");
-    return showMyFiles(ctx);
-  } catch (error) { console.error("User file delete error:", error.message); return ctx.answerCbQuery("Delete করা যায়নি।", { show_alert: true }); }
-});
-bot.action("user_upload", async (ctx) => { personalUploadStates.set(ctx.from.id, { createdAt: Date.now() }); await ctx.answerCbQuery(); return ctx.reply("📤 আপনার personal storage-এ যে file/video/audio/APK/document রাখতে চান সেটি পাঠান।\n\nবাতিল করতে /cancel লিখুন।", userMainKeyboard()); });
+bot.action("user_file_ids", async (ctx) => { await ctx.answerCbQuery(); return showUserFileIds(ctx, 0, false); });
+bot.action(/^user_file_ids_page_(\d+)$/, async (ctx) => { await ctx.answerCbQuery(); return showUserFileIds(ctx, Number(ctx.match[1]), true); });
+bot.action("user_delete_file_prompt", async (ctx) => { await ctx.answerCbQuery(); personalUploadStates.delete(ctx.from.id); adminInputStates.set(ctx.from.id, { type: "user_delete_file_id" }); return ctx.reply("🗑️ যে একটি File delete করতে চান, তার MongoDB File ID পাঠান।\n\nFile ID দেখতে 🆔 My File IDs চাপুন।\nবাতিল করতে /cancel লিখুন।", userMainKeyboard()); });
+bot.action("user_upload", async (ctx) => { const user = await ensureUser(ctx.from); await ctx.answerCbQuery(); if (pendingBatches.has(ctx.from.id)) return ctx.reply("⚠️ আগে চলমান Batch শেষ করুন অথবা /cancelbatch দিয়ে বাতিল করুন।", userMainKeyboard()); if (isExpiredPaidUser(user)) return ctx.reply("⌛ Paid Subscription শেষ। পুরোনো ফাইল থাকবে, কিন্তু নতুন Upload-এর জন্য Admin-এর মাধ্যমে Renew করতে হবে।", userMainKeyboard()); personalUploadStates.set(ctx.from.id, { createdAt: Date.now() }); return ctx.reply("📤 আপনার personal storage-এ যে file/video/audio/APK/document রাখতে চান সেটি পাঠান।\n\nবাতিল করতে /cancel লিখুন।", userMainKeyboard()); });
 bot.action("user_links", async (ctx) => { await ctx.answerCbQuery(); return showMyLinks(ctx); });
 bot.action("subscription_contact", async (ctx) => { await ctx.answerCbQuery(); return ctx.reply(`💎 Premium Subscription\n\nআপনার Telegram ID: <code>${ctx.from.id}</code>\nএই ID Admin-কে পাঠিয়ে Premium activation/payment সম্পর্কে যোগাযোগ করুন।`, { parse_mode: "HTML", ...userMainKeyboard() }); });
 
@@ -1376,6 +1441,28 @@ bot.action("settings_add_button", async (ctx) => {
   }
 });
 
+// Personal users delete exactly one owned file by ID; ownership is always checked.
+bot.on("text", async (ctx, next) => {
+  if (!ctx.from || ctx.chat?.type !== "private" || isAdmin(ctx)) return next();
+  const text = String(ctx.message?.text || "").trim();
+  if (text.startsWith("/")) return next();
+  const state = adminInputStates.get(ctx.from.id);
+  if (state?.type !== "user_delete_file_id") return next();
+  if (!ObjectId.isValid(text)) return ctx.reply("সঠিক File ID পাঠাও। বাতিল করতে /cancel লিখুন।", userMainKeyboard());
+  try {
+    const file = await db.collection("personalFiles").findOne({ _id: new ObjectId(text), ownerId: ctx.from.id });
+    if (!file) return ctx.reply("❌ আপনার এই File ID-এর file পাওয়া যায়নি। সঠিক ID পাঠাও অথবা /cancel লিখুন।", userMainKeyboard());
+    try { await ctx.telegram.deleteMessage(file.storageChannelId, file.storageMessageId); } catch (error) { console.error("User file delete storage error:", error.message); }
+    await db.collection("personalFiles").deleteOne({ _id: file._id, ownerId: ctx.from.id });
+    await db.collection("users").updateOne({ telegramId: ctx.from.id, personalFileCount: { $gt: 0 } }, { $inc: { storageUsedBytes: -(Number(file.fileSize) || 0), personalFileCount: -1 }, $set: { updatedAt: new Date() } });
+    adminInputStates.delete(ctx.from.id);
+    return ctx.reply(`✅ File deleted successfully.\n\nID: ${text}`, userMainKeyboard());
+  } catch (error) {
+    console.error("User file ID delete error:", error.message);
+    return ctx.reply("❌ File delete করা যায়নি। আবার চেষ্টা করো।", userMainKeyboard());
+  }
+});
+
 // Receive text for Start Text or Add Button setup.
 bot.on("text", async (ctx, next) => {
   if (!(await isStaff(ctx)) || ctx.chat?.type !== "private") {
@@ -1395,6 +1482,9 @@ bot.on("text", async (ctx, next) => {
   const state = adminInputStates.get(ctx.from.id);
   if (!state) {
     return next();
+  }
+  if (String(state.type).startsWith("admin_premium_") || String(state.type).startsWith("admin_set_limits_") || String(state.type).startsWith("admin_reset_limits_")) {
+    if (!isAdmin(ctx)) return ctx.reply("⛔ Only Admin can manage subscriptions and custom limits.");
   }
 
   // Let bot commands run their normal handlers. /cancel handles setup cancellation below.
@@ -1585,7 +1675,7 @@ bot.on("text", async (ctx, next) => {
 
   if (state.type === "admin_user_search") {
     const query = value.replace(/^@/, ""); adminInputStates.delete(ctx.from.id); const user = /^\d+$/.test(query) ? await db.collection("users").findOne({ telegramId: Number(query) }) : await db.collection("users").findOne({ username: query });
-    if (!user) return ctx.reply("❌ User পাওয়া যায়নি।"); const settings = await getBotSettings(); const limits = getPlanLimits(user, settings); return ctx.reply(`👤 User Details\n\nID: <code>${user.telegramId}</code>\nUsername: ${user.username ? "@" + escapeHtml(user.username) : "—"}\nPlan: ${limits.plan}\nStorage: ${bytesToText(user.storageUsedBytes)} / ${bytesToText(limits.storageBytes)}\nFiles: ${user.personalFileCount}/${limits.fileLimit}\nBanned: ${user.banned ? "Yes" : "No"}`, { parse_mode: "HTML" });
+    if (!user) return ctx.reply("❌ User পাওয়া যায়নি।"); const settings = await getBotSettings(); const limits = getPlanLimits(user, settings); const expiryText = user.subscriptionExpiresAt ? new Date(user.subscriptionExpiresAt).toLocaleString("en-GB") : "—"; return ctx.reply(`👤 User Details\n\nID: <code>${user.telegramId}</code>\nUsername: ${user.username ? "@" + escapeHtml(user.username) : "—"}\nPlan: ${escapeHtml(getSubscriptionLabel(user))}\nExpiry: ${escapeHtml(expiryText)}\nStorage: ${bytesToText(user.storageUsedBytes)} / ${bytesToText(limits.storageBytes)}\nFiles: ${user.personalFileCount}/${limits.fileLimit}\nCustom Storage Limit: ${Number(user.customStorageLimitBytes) > 0 ? bytesToText(user.customStorageLimitBytes) : "Plan default"}\nCustom File Limit: ${Number(user.customFileLimit) > 0 ? user.customFileLimit : "Plan default"}\nBanned: ${user.banned ? "Yes" : "No"}`, { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("⭐ Activate / Renew Paid", "admin_premium_activate")], [Markup.button.callback("⚖️ Set Member Limits", "admin_set_user_limits")], [Markup.button.callback("♻️ Reset Member Limits", "admin_reset_user_limits")]]) });
   }
 
   if (state.type === "admin_file_search") {
@@ -1640,8 +1730,58 @@ bot.on("text", async (ctx, next) => {
     if (!/^\d+$/.test(value)) return ctx.reply("সঠিক Telegram User ID পাঠাও।"); const id = Number(value); if (id === ADMIN_ID) return ctx.reply("Admin-কে Moderator করা যাবে না."); const settings = await getBotSettings(); const mods = settings.moderators || []; const next = state.type === "moderator_add" ? Array.from(new Set([...mods, id])).slice(0, 50) : mods.filter((x) => x !== id); await db.collection("settings").updateOne({ _id: "botSettings" }, { $set: { moderators: next, updatedAt: new Date() } }, { upsert: true }); adminInputStates.delete(ctx.from.id); return ctx.reply(state.type === "moderator_add" ? "✅ Moderator added." : "✅ Moderator removed.");
   }
 
-  if (state.type === "admin_premium_activate" || state.type === "admin_premium_remove") {
-    if (!/^\d+$/.test(value)) return ctx.reply("সঠিক Telegram User ID পাঠাও।"); const id = Number(value); const settings = await getBotSettings(); adminInputStates.delete(ctx.from.id); if (state.type === "admin_premium_activate") { const expires = new Date(Date.now() + settings.subscriptionPlans.premium.durationDays * 86400000); await db.collection("users").updateOne({ telegramId: id }, { $set: { plan: "premium", subscriptionStatus: "active", subscriptionExpiresAt: expires, updatedAt: new Date() }, $setOnInsert: { telegramId: id, firstSeenAt: new Date(), lastSeenAt: new Date(), storageUsedBytes: 0, personalFileCount: 0, banned: false } }, { upsert: true }); return ctx.reply(`✅ Premium activated for ${id}.`); } await db.collection("users").updateOne({ telegramId: id }, { $set: { plan: "free", subscriptionStatus: "free", subscriptionExpiresAt: null, updatedAt: new Date() } }); return ctx.reply(`✅ Premium removed for ${id}. Existing files remain.`);
+  if (state.type === "admin_premium_activate" || state.type === "admin_premium_remove" || state.type === "admin_set_limits_user" || state.type === "admin_reset_limits_user") {
+    if (!/^\d+$/.test(value)) return ctx.reply("সঠিক Telegram User ID পাঠাও।");
+    const id = Number(value);
+    if (!Number.isSafeInteger(id) || id <= 0) return ctx.reply("সঠিক Telegram User ID পাঠাও।");
+    if (state.type === "admin_premium_activate") {
+      adminInputStates.set(ctx.from.id, { type: "admin_premium_duration", targetUserId: id });
+      const existing = await db.collection("users").findOne({ telegramId: id });
+      const currentExpiry = existing?.subscriptionExpiresAt ? new Date(existing.subscriptionExpiresAt) : null;
+      return ctx.reply(`User ID: ${id}\nCurrent status: ${existing ? getSubscriptionLabel(existing) : "New user"}${currentExpiry ? `\nCurrent expiry: ${currentExpiry.toLocaleString("en-GB")}` : ""}\n\nPaid মেয়াদ কত দিন হবে? 1 থেকে 36500-এর মধ্যে পূর্ণ সংখ্যা পাঠাও।\nActive Paid থাকলে নতুন মেয়াদ বর্তমান expiry-এর সঙ্গে যোগ হবে; মেয়াদ শেষ হলে আজ থেকে শুরু হবে।`);
+    }
+    if (state.type === "admin_premium_remove") {
+      const result = await db.collection("users").updateOne({ telegramId: id }, { $set: { plan: "free", subscriptionStatus: "free", subscriptionExpiresAt: null, updatedAt: new Date() } });
+      adminInputStates.delete(ctx.from.id);
+      return ctx.reply(result.matchedCount ? `✅ User ${id}-এর Paid remove হয়েছে। পুরোনো ফাইল থাকবে।` : `⚠️ User ${id} এখনো database-এ নেই।`);
+    }
+    if (state.type === "admin_set_limits_user") {
+      adminInputStates.set(ctx.from.id, { type: "admin_set_limits_storage", targetUserId: id });
+      return ctx.reply(`User ID: ${id}\nCustom Storage limit কত MB হবে? 1 থেকে 1000000-এর মধ্যে সংখ্যা পাঠাও।`);
+    }
+    const result = await db.collection("users").updateOne({ telegramId: id }, { $unset: { customStorageLimitBytes: "", customFileLimit: "" }, $set: { updatedAt: new Date() } });
+    adminInputStates.delete(ctx.from.id);
+    return ctx.reply(result.matchedCount ? `✅ User ${id}-এর custom limits reset হয়েছে। এখন Plan default limit কার্যকর হবে।` : `⚠️ User ${id} এখনো database-এ নেই।`);
+  }
+
+  if (state.type === "admin_premium_duration") {
+    const days = Number(value);
+    if (!Number.isInteger(days) || days < 1 || days > 36500) return ctx.reply("মেয়াদ 1 থেকে 36500 দিনের মধ্যে পূর্ণ সংখ্যা হতে হবে।");
+    const id = Number(state.targetUserId);
+    const now = new Date();
+    const existing = await db.collection("users").findOne({ telegramId: id });
+    const oldExpiry = existing?.subscriptionExpiresAt ? new Date(existing.subscriptionExpiresAt) : null;
+    const base = oldExpiry && oldExpiry > now && getUserPlan(existing) === "premium" ? oldExpiry : now;
+    const expires = new Date(base.getTime() + days * 86400000);
+    await db.collection("users").updateOne({ telegramId: id }, { $set: { plan: "premium", subscriptionStatus: "active", subscriptionExpiresAt: expires, updatedAt: now }, $setOnInsert: { telegramId: id, firstSeenAt: now, lastSeenAt: now, storageUsedBytes: 0, personalFileCount: 0, banned: false } }, { upsert: true });
+    adminInputStates.delete(ctx.from.id);
+    return ctx.reply(`✅ Paid ${existing && oldExpiry && oldExpiry > now ? "renewed" : "activated"} successfully.\n\n🆔 User ID: ${id}\n⏳ Added: ${days} day(s)\n📅 New expiry: ${expires.toLocaleString("en-GB")}`);
+  }
+
+  if (state.type === "admin_set_limits_storage") {
+    const mb = Number(value);
+    if (!Number.isInteger(mb) || mb < 1 || mb > 1000000) return ctx.reply("Storage limit 1 থেকে 1000000 MB-এর মধ্যে পূর্ণ সংখ্যা পাঠাও।");
+    adminInputStates.set(ctx.from.id, { type: "admin_set_limits_files", targetUserId: state.targetUserId, storageBytes: mb * 1024 * 1024 });
+    return ctx.reply(`Custom Storage: ${mb} MB\nএখন File limit কতটি হবে? 1 থেকে 1000000-এর মধ্যে পূর্ণ সংখ্যা পাঠাও।`);
+  }
+
+  if (state.type === "admin_set_limits_files") {
+    const files = Number(value);
+    if (!Number.isInteger(files) || files < 1 || files > 1000000) return ctx.reply("File limit 1 থেকে 1000000-এর মধ্যে পূর্ণ সংখ্যা পাঠাও।");
+    const id = Number(state.targetUserId);
+    const result = await db.collection("users").updateOne({ telegramId: id }, { $set: { customStorageLimitBytes: state.storageBytes, customFileLimit: files, updatedAt: new Date() } });
+    adminInputStates.delete(ctx.from.id);
+    return ctx.reply(result.matchedCount ? `✅ Custom limits save হয়েছে।\n\n🆔 User ID: ${id}\n💾 Storage: ${bytesToText(state.storageBytes)}\n📁 File limit: ${files}` : `⚠️ User ${id} database-এ নেই। User-কে আগে /start করতে হবে।`);
   }
 
   if (state.type === "ban_user" || state.type === "unban_user") {
@@ -1682,9 +1822,9 @@ bot.on("text", async (ctx, next) => {
 
 async function renderAdminUsers(ctx, page = 0) {
   const pageSize = 10; const total = await db.collection("users").countDocuments(); const maxPage = Math.max(0, Math.ceil(total / pageSize) - 1); page = Math.max(0, Math.min(page, maxPage));
-  const list = await db.collection("users").find({}, { projection: { telegramId: 1, firstName: 1, lastName: 1, username: 1, lastSeenAt: 1, banned: 1, plan: 1 } }).sort({ lastSeenAt: -1 }).skip(page * pageSize).limit(pageSize).toArray();
+  const list = await db.collection("users").find({}, { projection: { telegramId: 1, firstName: 1, lastName: 1, username: 1, lastSeenAt: 1, banned: 1, plan: 1, subscriptionStatus: 1, subscriptionExpiresAt: 1 } }).sort({ lastSeenAt: -1 }).skip(page * pageSize).limit(pageSize).toArray();
   let message = `👥 <b>USER MANAGEMENT</b>\n\nTotal Users: ${total}\nPage: ${page + 1}/${maxPage + 1}\n\n`;
-  message += list.length ? list.map((u, i) => `${page * pageSize + i + 1}. ${escapeHtml([u.firstName, u.lastName].filter(Boolean).join(" ") || "No Name")}\n🆔 <code>${u.telegramId}</code> ${u.banned ? "🚫" : "🟢"} ${u.plan === "premium" ? "⭐" : ""}`).join("\n\n") : "কোনো user নেই।";
+  message += list.length ? list.map((u, i) => `${page * pageSize + i + 1}. ${escapeHtml([u.firstName, u.lastName].filter(Boolean).join(" ") || "No Name")}\n🆔 <code>${u.telegramId}</code> ${u.banned ? "🚫" : "🟢"} ${getUserPlan(u) === "premium" ? "⭐ Paid" : isExpiredPaidUser(u) ? "⌛ Expired" : "🆓 Free"}`).join("\n\n") : "কোনো user নেই।";
   const rows = []; if (page > 0 || page < maxPage) rows.push([...(page > 0 ? [Markup.button.callback("⬅️ Previous", `admin_users_page_${page - 1}`)] : []), ...(page < maxPage ? [Markup.button.callback("Next ➡️", `admin_users_page_${page + 1}`)] : [])]);
   rows.push([Markup.button.callback("🔎 Search User", "admin_user_search"), Markup.button.callback("🔄 Refresh", `admin_users_page_${page}`)]); rows.push([Markup.button.callback("⬅️ Admin Panel", "admin_back")]);
   return ctx.editMessageText(message, { parse_mode: "HTML", ...Markup.inlineKeyboard(rows) });
@@ -1693,9 +1833,43 @@ bot.action("admin_users", async (ctx) => { if (!(await isStaff(ctx))) return ctx
 bot.action(/^admin_users_page_(\d+)$/, async (ctx) => { if (!(await isStaff(ctx))) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return renderAdminUsers(ctx, Number(ctx.match[1])); });
 bot.action("admin_user_search", async (ctx) => { if (!(await isStaff(ctx))) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "admin_user_search" }); return ctx.reply("🔎 Telegram User ID বা username পাঠাও।"); });
 
-bot.action("admin_subscription", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return ctx.reply("💎 <b>Subscription Management</b>\n\nAdmin manually activate/remove Premium করতে পারবে।", { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("⭐ Activate Premium", "admin_premium_activate")], [Markup.button.callback("❌ Remove Premium", "admin_premium_remove")], [Markup.button.callback("⬅️ Admin Panel", "admin_back")]]) }); });
-bot.action("admin_premium_activate", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "admin_premium_activate" }); return ctx.reply("Premium activate করতে User ID পাঠাও।"); });
-bot.action("admin_premium_remove", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "admin_premium_remove" }); return ctx.reply("Premium remove করতে User ID পাঠাও।"); });
+bot.action("admin_subscription", async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized.");
+  await ctx.answerCbQuery();
+  const now = new Date();
+  const [totalUsers, paidCount, expiredCount] = await Promise.all([
+    db.collection("users").countDocuments(),
+    db.collection("users").countDocuments({ plan: "premium", subscriptionStatus: "active", $or: [{ subscriptionExpiresAt: { $gt: now } }, { subscriptionExpiresAt: null }, { subscriptionExpiresAt: { $exists: false } }] }),
+    db.collection("users").countDocuments({ plan: "premium", subscriptionExpiresAt: { $type: "date", $lte: now } })
+  ]);
+  const freeCount = Math.max(0, totalUsers - paidCount);
+  return ctx.reply(`💎 <b>Subscription Management</b>\n\n⭐ Active Paid: ${paidCount}\n🆓 Free / inactive: ${freeCount}\n⌛ Expired Paid: ${expiredCount}\n\nAdmin নিজে User ID ও মেয়াদ দিয়ে Paid চালু/Renew করতে পারবেন।`, { parse_mode: "HTML", ...Markup.inlineKeyboard([
+    [Markup.button.callback("⭐ Activate / Renew Paid", "admin_premium_activate")],
+    [Markup.button.callback("❌ Remove Paid", "admin_premium_remove")],
+    [Markup.button.callback("📋 Active Paid Members", "admin_paid_members")],
+    [Markup.button.callback("📋 Free Members", "admin_free_members")],
+    [Markup.button.callback("⚖️ Set Member Limits", "admin_set_user_limits")],
+    [Markup.button.callback("♻️ Reset Member Limits", "admin_reset_user_limits")],
+    [Markup.button.callback("🔎 Search / Manage User", "admin_user_search")],
+    [Markup.button.callback("⬅️ Admin Panel", "admin_back")]
+  ]) });
+});
+bot.action("admin_premium_activate", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "admin_premium_activate" }); return ctx.reply("Paid activate বা renew করতে User-এর Telegram ID পাঠাও।\n\nএরপর মেয়াদ কত দিন হবে তা চাইবে। বাতিল করতে /cancel পাঠাও।"); });
+bot.action("admin_premium_remove", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "admin_premium_remove" }); return ctx.reply("Paid remove করতে User ID পাঠাও। পুরোনো ফাইল মুছে যাবে না।"); });
+bot.action("admin_set_user_limits", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "admin_set_limits_user" }); return ctx.reply("যে User-এর Storage ও File limit পরিবর্তন করতে চান, তার Telegram User ID পাঠাও।"); });
+bot.action("admin_reset_user_limits", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "admin_reset_limits_user" }); return ctx.reply("যে User-এর custom limit reset করতে চান, তার Telegram User ID পাঠাও। Reset করলে তার বর্তমান Plan-এর default limit কার্যকর হবে।"); });
+async function showSubscriptionMembers(ctx, type) {
+  const now = new Date();
+  const filter = type === "paid"
+    ? { plan: "premium", subscriptionStatus: "active", $or: [{ subscriptionExpiresAt: { $gt: now } }, { subscriptionExpiresAt: null }, { subscriptionExpiresAt: { $exists: false } }] }
+    : { $or: [{ plan: { $ne: "premium" } }, { subscriptionStatus: { $ne: "active" } }, { subscriptionExpiresAt: { $type: "date", $lte: now } }] };
+  const selected = await db.collection("users").find(filter).sort({ lastSeenAt: -1 }).limit(40).toArray();
+  const title = type === "paid" ? "⭐ Active Paid Members" : "🆓 Free / Expired Members";
+  const body = selected.length ? selected.map((u, i) => `${i + 1}. ${escapeHtml([u.firstName, u.lastName].filter(Boolean).join(" ") || "No Name")}\n🆔 <code>${u.telegramId}</code>\nStatus: ${escapeHtml(getSubscriptionLabel(u))}${u.subscriptionExpiresAt ? `\nExpiry: ${escapeHtml(new Date(u.subscriptionExpiresAt).toLocaleString("en-GB"))}` : ""}`).join("\n\n") : "এই তালিকায় কোনো user পাওয়া যায়নি।";
+  return ctx.reply(`<b>${title}</b>\n\nShowing ${selected.length} latest matching users (maximum 40).\n\n${body}`, { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("🔎 Search / Manage User", "admin_user_search")], [Markup.button.callback("⬅️ Subscription", "admin_subscription")]]) });
+}
+bot.action("admin_paid_members", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showSubscriptionMembers(ctx, "paid"); });
+bot.action("admin_free_members", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return showSubscriptionMembers(ctx, "free"); });
 bot.action("admin_moderator", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); return ctx.reply("👮 <b>Moderator Management</b>", { parse_mode: "HTML", ...Markup.inlineKeyboard([[Markup.button.callback("➕ Add Moderator", "moderator_add")], [Markup.button.callback("🗑️ Remove Moderator", "moderator_remove")], [Markup.button.callback("📋 List Moderators", "moderator_list")], [Markup.button.callback("⬅️ Admin Panel", "admin_back")]]) }); });
 bot.action("moderator_add", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "moderator_add" }); return ctx.reply("Moderator-এর Telegram User ID পাঠাও।"); });
 bot.action("moderator_remove", async (ctx) => { if (!isAdmin(ctx)) return ctx.answerCbQuery("Not authorized."); await ctx.answerCbQuery(); adminInputStates.set(ctx.from.id, { type: "moderator_remove" }); return ctx.reply("Moderator-এর Telegram User ID পাঠাও।"); });
@@ -1723,18 +1897,16 @@ bot.action("admin_back", async (ctx) => {
 bot.on(
   ["document", "video", "audio", "photo", "animation", "voice", "video_note"],
   async (ctx, next) => {
-    if (!isAdmin(ctx)) return next();
+    const userId = ctx.from?.id;
+    if (!userId || ctx.chat?.type !== "private") return next();
 
-    const userId = ctx.from.id;
-    const adminState = adminInputStates.get(userId);
-
-
-    const broadcast = broadcastStates.get(userId);
+    const adminState = isAdmin(ctx) ? adminInputStates.get(userId) : null;
+    const broadcast = isAdmin(ctx) ? broadcastStates.get(userId) : null;
     if (broadcast && broadcast.status === "collecting") {
       return addBroadcastMessage(ctx);
     }
 
-    // Start Photo setup takes priority over normal file/batch upload collection.
+    // Start Photo setup is an admin-only action and takes priority over uploads.
     if (adminState?.type === "start_photo") {
       if (!ctx.message.photo || ctx.message.photo.length === 0) {
         return ctx.reply(
@@ -1784,16 +1956,20 @@ bot.on(
 
     // Collect files only while a batch is collecting.
     if (batch && batch.status === "collecting") {
+      if (batch.files.length >= 10) {
+        return ctx.reply("⚠️ প্রতি Batch-এ সর্বোচ্চ ১০টি ফাইল রাখা যাবে।\nএই Batch শেষ করতে /finishbatch পাঠাও, অথবা /cancelbatch দিয়ে বাতিল করো।");
+      }
       batch.files.push({
         chatId: ctx.chat.id,
         messageId: ctx.message.message_id,
         fileType,
+        mediaGroupId: ctx.message.media_group_id || null,
         ...getMessageFileMeta(ctx.message)
       });
 
       return ctx.reply(
-        `✅ Batch-এ ${batch.files.length}টি ফাইল যোগ হয়েছে।\n\n` +
-        "আরও ফাইল পাঠাতে পারো।\n" +
+        `✅ Batch-এ ${batch.files.length}/10টি ফাইল যোগ হয়েছে।\n\n` +
+        "Album অথবা একটির পর একটি ফাইল পাঠাতে পারো।\n" +
         "সব শেষ হলে /finishbatch পাঠাও।\n" +
         "বাতিল করতে /cancelbatch পাঠাও।"
       );
@@ -1806,6 +1982,9 @@ bot.on(
         "আগে সেই Batch সম্পন্ন করো অথবা বাতিল করো।"
       );
     }
+
+    // Non-admin files without an active share-batch belong to the personal-upload middleware below.
+    if (!isAdmin(ctx)) return next();
 
     const pending = pendingFiles.get(userId);
 
@@ -1972,7 +2151,15 @@ bot.action("genlink_confirm", async (ctx) => {
 // Cancel single upload or Start Message admin input
 bot.command("cancel", async (ctx) => {
   if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ You are not authorized.");
+    if (personalUploadStates.has(ctx.from.id)) {
+      personalUploadStates.delete(ctx.from.id);
+      return ctx.reply("❌ Personal upload cancelled.", userMainKeyboard());
+    }
+    if (adminInputStates.has(ctx.from.id)) {
+      adminInputStates.delete(ctx.from.id);
+      return ctx.reply("❌ Delete/input request cancelled.", userMainKeyboard());
+    }
+    return ctx.reply("ℹ️ বাতিল করার মতো কোনো চলমান কাজ নেই।", userMainKeyboard());
   }
 
   if (broadcastStates.has(ctx.from.id)) {
@@ -2013,10 +2200,6 @@ bot.command("batch", async (ctx) => {
 
 // Review batch
 bot.command("finishbatch", async (ctx) => {
-  if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ You are not authorized.");
-  }
-
   const batch = pendingBatches.get(ctx.from.id);
 
   if (!batch || batch.status !== "collecting") {
@@ -2029,6 +2212,9 @@ bot.command("finishbatch", async (ctx) => {
       "আগে ফাইল পাঠাও, তারপর /finishbatch পাঠাও।"
     );
   }
+  if (batch.files.length > 10) return ctx.reply("❌ প্রতি Batch-এ সর্বোচ্চ ১০টি ফাইল অনুমোদিত।");
+  const quotaError = await validateBatchQuota(ctx, batch);
+  if (quotaError) return ctx.reply(quotaError, userMainKeyboard());
 
   batch.status = "review";
 
@@ -2046,10 +2232,6 @@ bot.command("finishbatch", async (ctx) => {
 
 // Cancel batch from review keyboard
 bot.action("batch_cancel", async (ctx) => {
-  if (!isAdmin(ctx)) {
-    return ctx.answerCbQuery("⛔ Not authorized.");
-  }
-
   const userId = ctx.from.id;
   const batch = pendingBatches.get(userId);
 
@@ -2077,10 +2259,6 @@ bot.action("batch_cancel", async (ctx) => {
 
 // Cancel batch by command
 bot.command("cancelbatch", async (ctx) => {
-  if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ You are not authorized.");
-  }
-
   const userId = ctx.from.id;
   const batch = pendingBatches.get(userId);
 
@@ -2106,10 +2284,6 @@ bot.command("cancelbatch", async (ctx) => {
 
 // Confirm and store batch
 bot.action("batch_confirm", async (ctx) => {
-  if (!isAdmin(ctx)) {
-    return ctx.answerCbQuery("⛔ Not authorized.");
-  }
-
   const userId = ctx.from.id;
   const batch = pendingBatches.get(userId);
 
@@ -2133,11 +2307,23 @@ bot.action("batch_confirm", async (ctx) => {
     return ctx.answerCbQuery("Database প্রস্তুত নয়।", { show_alert: true });
   }
 
-  if (!Array.isArray(batch.files) || batch.files.length === 0) {
-    return ctx.answerCbQuery("Batch-এ কোনো ফাইল নেই।", { show_alert: true });
+  if (!Array.isArray(batch.files) || batch.files.length === 0 || batch.files.length > 10) {
+    return ctx.answerCbQuery("Batch-এ ১ থেকে ১০টি ফাইল থাকতে হবে।", { show_alert: true });
   }
-
   batch.inProgress = true;
+  if (!batch.databaseId) {
+    try {
+      const quotaError = await validateBatchQuota(ctx, batch);
+      if (quotaError) {
+        batch.inProgress = false;
+        return ctx.answerCbQuery(quotaError.slice(0, 190), { show_alert: true });
+      }
+    } catch (error) {
+      batch.inProgress = false;
+      console.error("Batch quota validation error:", error.message);
+      return ctx.answerCbQuery("Quota যাচাই করা যায়নি। একটু পরে আবার চেষ্টা করুন।", { show_alert: true });
+    }
+  }
 
   try {
     await ctx.answerCbQuery("ফাইলগুলো Store করা হচ্ছে...");
@@ -2147,8 +2333,13 @@ bot.action("batch_confirm", async (ctx) => {
 
     if (!batch.databaseId) {
       const currentSettings = await getBotSettings();
+      const isQuotaUserBatch = !isAdmin(ctx);
+      const quotaStorageBytes = batch.files.reduce((sum, file) => sum + Math.max(0, Number(file.fileSize) || 0), 0);
       const result = await collection.insertOne({
         uploadedBy: userId,
+        countsTowardQuota: isQuotaUserBatch,
+        quotaFileCount: isQuotaUserBatch ? batch.files.length : 0,
+        quotaStorageBytes: isQuotaUserBatch ? quotaStorageBytes : 0,
         status: "processing",
         sourceFiles: batch.files.map((file) => ({
           chatId: file.chatId,
@@ -2332,9 +2523,10 @@ bot.on(["document", "video", "audio", "photo", "animation", "voice", "video_note
   const state = personalUploadStates.get(ctx.from.id); if (!state) return next();
   if (Date.now() - state.createdAt > 30 * 60 * 1000) { personalUploadStates.delete(ctx.from.id); return ctx.reply("⌛ Upload session expired. আবার 📤 Upload File চাপুন.", userMainKeyboard()); }
   try {
-    const settings = await getBotSettings(); const user = await ensureUser(ctx.from); const info = getUserFileInfo(ctx.message); const limits = getPlanLimits(user, settings); const size = Math.max(0, Number(info.fileSize) || 0);
-    if (Number(user.personalFileCount || 0) + 1 > limits.fileLimit) return ctx.reply(`❌ File limit পূর্ণ: ${limits.fileLimit} files.`, userMainKeyboard());
-    if (Number(user.storageUsedBytes || 0) + size > limits.storageBytes) return ctx.reply(`❌ Storage limit পূর্ণ: ${bytesToText(user.storageUsedBytes)} / ${bytesToText(limits.storageBytes)}.`, userMainKeyboard());
+    const settings = await getBotSettings(); const user = await ensureUser(ctx.from); const info = getUserFileInfo(ctx.message); const limits = getPlanLimits(user, settings); const size = Math.max(0, Number(info.fileSize) || 0); const usage = await getQuotaUsage(user);
+    if (isExpiredPaidUser(user)) return ctx.reply("⌛ আপনার Paid Subscription-এর মেয়াদ শেষ হয়েছে।\n\nআপনার পুরোনো ফাইল ও লিংক থাকবে এবং দেখা/ডাউনলোড করা যাবে। নতুন Upload চালু করতে Admin-এর মাধ্যমে Paid renew করুন।", userMainKeyboard());
+    if (usage.fileCount + 1 > limits.fileLimit) return ctx.reply(`❌ File limit পূর্ণ: ${usage.fileCount}/${limits.fileLimit} files.`, userMainKeyboard());
+    if (usage.storageBytes + size > limits.storageBytes) return ctx.reply(`❌ Storage limit পূর্ণ: ${bytesToText(usage.storageBytes)} / ${bytesToText(limits.storageBytes)}.`, userMainKeyboard());
     const storageChannelId = await choosePersonalStorageChannel(info.fileType); const copied = await ctx.telegram.copyMessage(storageChannelId, ctx.chat.id, ctx.message.message_id);
     const inserted = await db.collection("personalFiles").insertOne({ ownerId: ctx.from.id, fileType: info.fileType, storageChannelId: String(storageChannelId), storageMessageId: copied.message_id, fileName: info.fileName || "", fileSize: size, caption: info.caption || "", createdAt: new Date() });
     const quotaUpdate = await db.collection("users").updateOne({ telegramId: ctx.from.id, storageUsedBytes: { $lte: limits.storageBytes - size }, personalFileCount: { $lt: limits.fileLimit } }, { $inc: { storageUsedBytes: size, personalFileCount: 1 }, $set: { updatedAt: new Date() } });
@@ -2349,6 +2541,16 @@ bot.catch((error) => {
 });
 
 // Connect MongoDB before starting the bot.
+async function expireDueSubscriptions() {
+  if (!db) return;
+  const now = new Date();
+  const result = await db.collection("users").updateMany(
+    { plan: "premium", subscriptionStatus: "active", subscriptionExpiresAt: { $lte: now } },
+    { $set: { subscriptionStatus: "expired", updatedAt: now } }
+  );
+  if (result.modifiedCount) console.log(`Marked ${result.modifiedCount} subscription(s) as expired.`);
+}
+
 async function main() {
   await mongoClient.connect();
   await mongoClient.db("admin").command({ ping: 1 });
@@ -2358,8 +2560,10 @@ async function main() {
   await ensureIndexes();
   await getBotSettings();
   await processDueDeletes();
+  await expireDueSubscriptions();
   await bot.launch();
   setInterval(() => processDueDeletes().catch((error) => console.error("Scheduled delete recovery error:", error.message)), 60 * 1000).unref?.();
+  setInterval(() => expireDueSubscriptions().catch((error) => console.error("Subscription expiry recovery error:", error.message)), 60 * 1000).unref?.();
 
   console.log("Telegram bot started successfully.");
 }
