@@ -50,10 +50,11 @@ const personalUploadStates = new Map();
 const forceSubCache = new Map();
 const paidForceSubCache = new Map();
 const pendingPaidForceSubFiles = new Map();
+const pendingGlobalStartPayloads = new Map();
 const FORCE_SUB_CACHE_TTL_MS = 30 * 1000;
 const USER_ACTIVITY_WRITE_INTERVAL_MS = 5 * 60 * 1000;
-const DEFAULT_FREE_STORAGE_BYTES = 500 * 1024 * 1024;
-const DEFAULT_FREE_FILE_LIMIT = 50;
+const DEFAULT_FREE_STORAGE_BYTES = 100 * 1024 * 1024;
+const DEFAULT_FREE_FILE_LIMIT = 10;
 const DEFAULT_PREMIUM_STORAGE_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_PREMIUM_FILE_LIMIT = 1000;
 const BOT_SETTINGS_CACHE_TTL_MS = 15 * 1000;
@@ -158,9 +159,11 @@ async function getBotSettings(forceRefresh = false) {
     linkShortener: settings?.linkShortener && typeof settings.linkShortener === "object" ? { enabled: settings.linkShortener.enabled === true, name: settings.linkShortener.name || "", apiUrl: settings.linkShortener.apiUrl || "", apiKey: settings.linkShortener.apiKey || "" } : { enabled: false, name: "", apiUrl: "", apiKey: "" },
     moderators: Array.isArray(settings?.moderators) ? settings.moderators.map(Number).filter(Number.isSafeInteger).slice(0, 50) : [],
     subscriptionPlans: {
+      // Keep the Free plan on the fixed defaults even if an older database
+      // contains legacy custom limits from previous versions.
       free: {
-        storageBytes: Number(settings?.subscriptionPlans?.free?.storageBytes) > 0 ? Number(settings.subscriptionPlans.free.storageBytes) : DEFAULT_FREE_STORAGE_BYTES,
-        fileLimit: Number(settings?.subscriptionPlans?.free?.fileLimit) > 0 ? Number(settings.subscriptionPlans.free.fileLimit) : DEFAULT_FREE_FILE_LIMIT
+        storageBytes: DEFAULT_FREE_STORAGE_BYTES,
+        fileLimit: DEFAULT_FREE_FILE_LIMIT
       },
       premium: {
         storageBytes: Number(settings?.subscriptionPlans?.premium?.storageBytes) > 0 ? Number(settings.subscriptionPlans.premium.storageBytes) : DEFAULT_PREMIUM_STORAGE_BYTES,
@@ -275,9 +278,9 @@ function getPlanLimits(user, settings) {
   if (plan === "premium") {
     return { plan, storageBytes: Infinity, fileLimit: Infinity, durationDays: base.durationDays };
   }
-  const storageBytes = Number(user?.customStorageLimitBytes) > 0 ? Number(user.customStorageLimitBytes) : base.storageBytes;
-  const fileLimit = Number(user?.customFileLimit) > 0 ? Number(user.customFileLimit) : base.fileLimit;
-  return { plan, storageBytes, fileLimit };
+  // Free users always use the bot's standard Free plan limits.
+  // Legacy custom member limits are intentionally ignored.
+  return { plan, storageBytes: base.storageBytes, fileLimit: base.fileLimit };
 }
 
 async function ensureIndexes() {
@@ -918,7 +921,8 @@ async function getMissingForceSubChannels(ctx, settings) {
 async function getMissingPaidForceSubChannels(ctx, user) {
   const paid = getPaidUserSettings(user);
   if (!isActivePaidUser(user) || !paid.forceSubEnabled || !paid.forceSubChannels.length) return [];
-  const cached = paidForceSubCache.get(ctx.from.id);
+  const cacheKey = `${ctx.from.id}:${user.telegramId}`;
+  const cached = paidForceSubCache.get(cacheKey);
   if (cached && Date.now() - cached.at < FORCE_SUB_CACHE_TTL_MS) return cached.missing;
   const missing = [];
   for (const channel of paid.forceSubChannels) {
@@ -930,7 +934,7 @@ async function getMissingPaidForceSubChannels(ctx, user) {
       missing.push(channel);
     }
   }
-  paidForceSubCache.set(ctx.from.id, { missing, at: Date.now() });
+  paidForceSubCache.set(cacheKey, { missing, at: Date.now() });
   return missing;
 }
 
@@ -946,28 +950,41 @@ async function requirePaidForceSubForPersonalFile(ctx, file, ownerUser) {
   if (!paid.forceSubEnabled || !paid.forceSubChannels.length) return true;
   const missing = await getMissingPaidForceSubChannels(ctx, ownerUser);
   if (!missing.length) return true;
-  pendingPaidForceSubFiles.set(ctx.from.id, String(file._id));
+  pendingPaidForceSubFiles.set(ctx.from.id, { fileId: String(file._id), ownerId: Number(file.ownerId) });
   const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || "বন্ধু";
   const text = paid.forceSubMessage.replace(/\{mention\}/g, escapeHtml(name)).replace(/\{count\}/g, String(missing.length));
   await ctx.reply(text, paidForceSubKeyboard(missing));
   return false;
 }
 
+async function deliverPersonalFileById(ctx, id) {
+  if (!ObjectId.isValid(String(id))) {
+    await ctx.reply("❌ Personal File Link সঠিক নয়。");
+    return false;
+  }
+  const file = await db.collection("personalFiles").findOne({ _id: new ObjectId(String(id)) });
+  if (!file) {
+    await ctx.reply("❌ File পাওয়া যায়নি।");
+    return false;
+  }
+  // Option B: personal share links are shareable by anyone who has the link.
+  const ownerUser = await db.collection("users").findOne({ telegramId: Number(file.ownerId) });
+  if (!(await requirePaidForceSubForPersonalFile(ctx, file, ownerUser))) return false;
+  const settings = await getBotSettings();
+  const sent = await ctx.telegram.copyMessage(
+    ctx.chat.id,
+    file.storageChannelId,
+    file.storageMessageId,
+    makePersonalDeliveryOptions(file, ownerUser)
+  );
+  if (settings.autoDeleteEnabled) await scheduleDelete(ctx, sent, settings.autoDeleteMinutes);
+  pendingPaidForceSubFiles.delete(ctx.from.id);
+  return true;
+}
+
 async function enforceForceSub(ctx, next) {
   if (!ctx.from || ctx.from.id === ADMIN_ID || ctx.chat?.type !== "private") return next();
   if (ctx.callbackQuery?.data === "force_sub_check") return next();
-  if (ctx.startPayload?.startsWith("pfile_")) {
-    try {
-      const id = ctx.startPayload.slice(6);
-      if (ObjectId.isValid(id)) {
-        const personal = await db.collection("personalFiles").findOne({ _id: new ObjectId(id) });
-        if (personal) {
-          const owner = await db.collection("users").findOne({ telegramId: personal.ownerId });
-          if (isActivePaidUser(owner)) return next();
-        }
-      }
-    } catch (error) { console.error("Personal paid force-sub precheck error:", error.message); }
-  }
   try {
     const settings = await getBotSettings();
     const missing = await getMissingForceSubChannels(ctx, settings);
@@ -979,6 +996,9 @@ async function enforceForceSub(ctx, next) {
     if (ctx.callbackQuery) {
       await ctx.answerCbQuery("আগে সব channel-এ join করুন।", { show_alert: true }).catch(() => {});
       return;
+    }
+    if (ctx.startPayload?.startsWith("pfile_")) {
+      pendingGlobalStartPayloads.set(ctx.from.id, ctx.startPayload);
     }
     return ctx.reply(text, forceSubKeyboard(missing));
   } catch (error) {
@@ -1110,19 +1130,12 @@ bot.start(async (ctx) => {
 
   if (payload && payload.startsWith("pfile_")) {
     if (ctx.chat?.type !== "private") return ctx.reply("ফাইল পেতে Bot-কে Private Chat-এ খুলুন।");
-    const id = payload.slice(6);
-    if (!ObjectId.isValid(id)) return ctx.reply("❌ Personal File Link সঠিক নয়।");
     try {
-      const file = await db.collection("personalFiles").findOne({ _id: new ObjectId(id) });
-      if (!file) return ctx.reply("❌ File পাওয়া যায়নি।");
-      if (file.ownerId !== ctx.from.id) return ctx.reply("⛔ এই Personal File Link শুধু owner-এর জন্য।");
-      const ownerUser = await db.collection("users").findOne({ telegramId: file.ownerId });
-      if (!(await requirePaidForceSubForPersonalFile(ctx, file, ownerUser))) return;
-      const settings = await getBotSettings();
-      const sent = await ctx.telegram.copyMessage(ctx.chat.id, file.storageChannelId, file.storageMessageId, makePersonalDeliveryOptions(file, ownerUser));
-      if (settings.autoDeleteEnabled) await scheduleDelete(ctx, sent, settings.autoDeleteMinutes);
-      pendingPaidForceSubFiles.delete(ctx.from.id);
-    } catch (error) { console.error("Personal file delivery error:", error.message); return ctx.reply("❌ Personal file পাঠানো যায়নি।"); }
+      await deliverPersonalFileById(ctx, payload.slice(6));
+    } catch (error) {
+      console.error("Personal file delivery error:", error.message);
+      return ctx.reply("❌ Personal file পাঠানো যায়নি।");
+    }
     return;
   }
 
@@ -1473,20 +1486,19 @@ bot.action("force_sub_check", async (ctx) => {
     return sendConfiguredStartMessage(ctx);
   }
   try {
-    const pendingId = pendingPaidForceSubFiles.get(ctx.from.id);
+    const pending = pendingPaidForceSubFiles.get(ctx.from.id);
+    const pendingId = typeof pending === "string" ? pending : pending?.fileId;
     if (pendingId && ObjectId.isValid(pendingId)) {
-      const file = await db.collection("personalFiles").findOne({ _id: new ObjectId(pendingId), ownerId: ctx.from.id });
+      const file = await db.collection("personalFiles").findOne({ _id: new ObjectId(pendingId) });
       if (file) {
-        const owner = await db.collection("users").findOne({ telegramId: file.ownerId });
-        paidForceSubCache.delete(ctx.from.id);
+        const owner = await db.collection("users").findOne({ telegramId: Number(file.ownerId) });
+        if (!owner) return ctx.answerCbQuery("ফাইলের owner পাওয়া যায়নি।", { show_alert: true });
+        paidForceSubCache.delete(`${ctx.from.id}:${owner.telegramId}`);
         const missingPaid = await getMissingPaidForceSubChannels(ctx, owner);
         if (missingPaid.length) return ctx.answerCbQuery("এখনো সব required channel-এ join করা হয়নি।", { show_alert: true });
         pendingPaidForceSubFiles.delete(ctx.from.id);
         await ctx.answerCbQuery("Subscription verified.");
-        const settings = await getBotSettings();
-        const sent = await ctx.telegram.copyMessage(ctx.chat.id, file.storageChannelId, file.storageMessageId, makePersonalDeliveryOptions(file, owner));
-        if (settings.autoDeleteEnabled) await scheduleDelete(ctx, sent, settings.autoDeleteMinutes);
-        return;
+        return deliverPersonalFileById(ctx, pendingId);
       }
       pendingPaidForceSubFiles.delete(ctx.from.id);
     }
@@ -1494,6 +1506,12 @@ bot.action("force_sub_check", async (ctx) => {
     forceSubCache.delete(ctx.from.id);
     const missing = await getMissingForceSubChannels(ctx, settings);
     if (missing.length) return ctx.answerCbQuery("এখনো সব channel-এ join করা হয়নি।", { show_alert: true });
+    const pendingPayload = pendingGlobalStartPayloads.get(ctx.from.id);
+    if (pendingPayload?.startsWith("pfile_")) {
+      pendingGlobalStartPayloads.delete(ctx.from.id);
+      await ctx.answerCbQuery("Subscription verified.");
+      return deliverPersonalFileById(ctx, pendingPayload.slice(6));
+    }
     await ctx.answerCbQuery("Subscription verified.");
     return sendConfiguredStartMessage(ctx);
   } catch (error) {
